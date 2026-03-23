@@ -9,7 +9,8 @@
     "ingest": "node scripts/ingest.js",
     "ingest:dry": "node scripts/ingest.js --dry-run",
     "migrate": "node scripts/run-migrations.js",
-    "validate": "node scripts/validate-ingestion.js"
+    "validate": "node scripts/validate-ingestion.js",
+    "extract-data": "node scripts/extract-course-data.js"
   },
   "engines": {
     "node": ">=18.0.0"
