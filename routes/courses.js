@@ -170,7 +170,7 @@ router.get("/:id/tees", async (req, res) => {
   try {
     const course = await courseIntelligence.getCourseById(pool, req.params.id);
     if (!course) return res.status(404).json({ error: "Course not found" });
-    const tees = await courseIntelligence.getTeesByCourseId(pool, req.params.id);
+    const tees = await courseIntelligence.getTeesByCourseId(pool, course.id);
     const withYards = await Promise.all(
       tees.map(async (t) => {
         const lengths = await courseIntelligence.getTeeLengthsByTeeId(pool, t.id);

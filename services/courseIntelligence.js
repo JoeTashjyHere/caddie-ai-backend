@@ -5,7 +5,25 @@
  * Serves MUST PREFETCH payload from GET /api/courses/:id
  */
 
+async function resolveCourseId(pool, idOrSlug) {
+  const val = String(idOrSlug || "").trim();
+  if (!val) return null;
+  const byUuid = await pool.query(
+    `SELECT gc.id FROM golf_courses gc WHERE gc.id::text = $1`,
+    [val]
+  );
+  if (byUuid.rows.length > 0) return byUuid.rows[0].id;
+  const byCourseId = await pool.query(
+    `SELECT gc.id FROM golf_courses gc WHERE gc.course_id = $1`,
+    [val]
+  );
+  if (byCourseId.rows.length > 0) return byCourseId.rows[0].id;
+  return null;
+}
+
 async function getCourseById(pool, courseUuid) {
+  const resolved = await resolveCourseId(pool, courseUuid);
+  if (!resolved) return null;
   const res = await pool.query(
     `SELECT gc.id, gc.course_id, gc.course_name, gc.num_holes, gc.lat, gc.lon,
             c.id AS club_id, c.name AS club_name, c.address AS club_address,
@@ -14,7 +32,7 @@ async function getCourseById(pool, courseUuid) {
      FROM golf_courses gc
      JOIN golf_clubs c ON gc.club_id = c.id
      WHERE gc.id = $1`,
-    [courseUuid]
+    [resolved]
   );
   if (res.rows.length === 0) return null;
   return res.rows[0];
@@ -97,11 +115,12 @@ function extractGreenFrontBack(pois) {
 async function getFullCoursePayload(pool, courseUuid) {
   const course = await getCourseById(pool, courseUuid);
   if (!course) return null;
+  const uuid = course.id;
 
   const [tees, holes, poisByHole] = await Promise.all([
-    getTeesByCourseId(pool, courseUuid),
-    getHolesByCourseId(pool, courseUuid),
-    getPoisByCourseHole(pool, courseUuid)
+    getTeesByCourseId(pool, uuid),
+    getHolesByCourseId(pool, uuid),
+    getPoisByCourseHole(pool, uuid)
   ]);
 
   const teeLengthsMap = {};
@@ -164,13 +183,15 @@ async function getFullCoursePayload(pool, courseUuid) {
  * Hole layout: POIs for a hole (for future polygon / point-in-polygon)
  * Returns structured POI data; polygons are future enhancement.
  */
-async function getHoleLayout(pool, courseUuid, holeNumber) {
+async function getHoleLayout(pool, courseUuidOrSlug, holeNumber) {
+  const uuid = await resolveCourseId(pool, courseUuidOrSlug);
+  if (!uuid) return null;
   const res = await pool.query(
     `SELECT hole_number, poi_type, location_label, fairway_side, lat, lon
      FROM golf_hole_pois
      WHERE course_id = $1 AND hole_number = $2
      ORDER BY poi_type, location_label`,
-    [courseUuid, holeNumber]
+    [uuid, holeNumber]
   );
   if (res.rows.length === 0) return null;
   return {
