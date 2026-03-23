@@ -4,6 +4,8 @@
 
 ### 1. Extract data from ZIP
 
+Place `coursedb_america.zip` at `/mnt/data/` (or any path) and run:
+
 ```bash
 cd backend
 npm run extract-data -- /mnt/data/coursedb_america.zip
@@ -11,6 +13,7 @@ npm run extract-data -- /mnt/data/coursedb_america.zip
 ```
 
 Validates and extracts `clubs.csv`, `courses.csv`, `tees.csv`, `coordinates.csv` to `data/`.
+Overwrites existing data. Sample data (Pebble Beach) is included for testing; replace with full ZIP.
 
 ### 2. Commit and push
 
