@@ -1,5 +1,7 @@
 "use strict";
 
+require("dotenv").config();
+
 /**
  * Caddie.AI Backend (Deploy-ready)
  * - Works on Render (PORT from env, binds 0.0.0.0)
@@ -68,8 +70,9 @@ if (DATABASE_URL && Pool) {
     connectionString: DATABASE_URL,
     ssl: DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false }
   });
+  app.set("dbPool", dbPool);
 } else if (!DATABASE_URL) {
-  console.warn("⚠️ DATABASE_URL is not set. Recommendation analytics will use in-memory storage only.");
+  console.warn("⚠️ DATABASE_URL is not set. Recommendation analytics and course intelligence will be unavailable.");
 }
 
 function safeTrim(v, maxLen = 120) {
@@ -599,7 +602,7 @@ app.post("/api/feedback/caddie", (req, res) => {
   return res.json({ ok: true });
 });
 
-// Courses endpoint
+// Legacy /api/courses list (exact path) - defined before router so it takes precedence
 app.get("/api/courses", async (req, res) => {
   try {
     const { lat, lon, query } = req.query;
@@ -640,6 +643,10 @@ app.get("/api/courses", async (req, res) => {
     return res.json({ source: "error-fallback", courses: localCourses });
   }
 });
+
+// Week 1 Course routes (Google Places, matching, course intelligence)
+const coursesRouter = require("./routes/courses");
+app.use("/api/courses", coursesRouter);
 
 // Text-only OpenAI endpoint
 app.post("/api/openai/complete", async (req, res) => {
