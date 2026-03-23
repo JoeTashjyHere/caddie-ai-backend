@@ -2,7 +2,7 @@
 "use strict";
 
 /**
- * Caddie.AI Week 1 CSV Ingestion Pipeline
+ * Caddie.AI Week 1 CSV Ingestion Pipeline (idempotent)
  *
  * CONFIRMED CSV RELATIONSHIPS:
  * - clubs.csv: ClubID = physical venue
@@ -11,29 +11,24 @@
  * - coordinates.csv: CourseID -> golf_courses (NOT ClubID); hole-level POIs per course
  *
  * Order: golf_clubs -> golf_courses -> golf_course_holes -> golf_tees -> golf_tee_hole_lengths -> golf_hole_pois
- * Final step: precompute course center from green POIs (Green + Location=C) or fallback to club lat/lon.
+ * Uses upserts (ON CONFLICT) throughout. Skips if data exists unless force=true.
  *
  * Usage:
- *   node scripts/ingest.js [--dry-run] [--data-dir=/path]
+ *   node scripts/ingest.js [--dry-run] [--data-dir=/path] [--force]
  *
- * --dry-run: Validate and report counts, no DB writes.
- * --data-dir: Directory containing CSV files (default: ../data or ./data)
+ * Env: DATA_SOURCE_TYPE=local|url, DATA_SOURCE_PATH=...
+ * Programmatic: runIngestion(pool, { dataDir, dryRun, force, closePool })
  */
 
 const fs = require("fs");
 const path = require("path");
 const { parse } = require("csv-parse/sync");
 const { Pool } = require("pg");
+const fetch = require("node-fetch");
 
 require("dotenv").config();
 
-const DRY_RUN = process.argv.includes("--dry-run") || process.argv.includes("-n");
-const DATA_DIR =
-  process.argv.find((a) => a.startsWith("--data-dir="))?.split("=")[1] ||
-  path.resolve(__dirname, "../data");
-
 const PROGRESS_INTERVAL = 5000;
-const DATABASE_URL = process.env.DATABASE_URL;
 
 const errorLogPath = path.join(process.cwd(), "ingestion_errors.log");
 let errorLog = [];
@@ -83,42 +78,89 @@ function validPar(p) {
   return Number.isInteger(i) && i >= 3 && i <= 6;
 }
 
-function readCsv(filePath) {
+function readCsvFromFile(filePath) {
   if (!fs.existsSync(filePath)) {
     throw new Error(`File not found: ${filePath}`);
   }
   const content = fs.readFileSync(filePath, "utf8");
-  const records = parse(content, {
+  return parse(content, {
     columns: true,
     skip_empty_lines: true,
     relax_column_count: true,
     trim: true
   });
-  return records;
 }
 
-async function runIngestion() {
-  const clubsPath = path.join(DATA_DIR, "clubs.csv");
-  const coursesPath = path.join(DATA_DIR, "courses.csv");
-  const teesPath = path.join(DATA_DIR, "tees.csv");
-  const coordsPath = path.join(DATA_DIR, "coordinates.csv");
+async function readCsvFromUrl(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
+  const content = await res.text();
+  return parse(content, {
+    columns: true,
+    skip_empty_lines: true,
+    relax_column_count: true,
+    trim: true
+  });
+}
 
-  for (const p of [clubsPath, coursesPath, teesPath, coordsPath]) {
-    if (!fs.existsSync(p)) {
-      console.error(`Missing file: ${p}`);
-      process.exit(1);
+async function readCsv(filePathOrUrl, sourceType) {
+  if (sourceType === "url") {
+    return readCsvFromUrl(filePathOrUrl);
+  }
+  return readCsvFromFile(filePathOrUrl);
+}
+
+/**
+ * Run ingestion. Idempotent (upserts). Skips if data exists unless force=true.
+ * @param {import("pg").Pool} pool
+ * @param {object} options
+ * @param {string} [options.dataDir] - Local path to CSV dir (when DATA_SOURCE_TYPE=local)
+ * @param {string} [options.dataSourceType] - local | url
+ * @param {string} [options.dataSourcePath] - Path or base URL
+ * @param {boolean} [options.dryRun]
+ * @param {boolean} [options.force] - Run even if data exists
+ * @param {boolean} [options.closePool=true] - Close pool when done (false when called from init)
+ * @returns {Promise<object>}
+ */
+async function runIngestion(pool, options = {}) {
+  const dataSourceType = options.dataSourceType || process.env.DATA_SOURCE_TYPE || "local";
+  const dataSourcePath =
+    options.dataDir ?? options.dataSourcePath ?? process.env.DATA_SOURCE_PATH ?? path.resolve(__dirname, "../data");
+  const DRY_RUN = options.dryRun ?? false;
+  const force = options.force ?? false;
+  const closePool = options.closePool !== false;
+
+  const basePath = (file) =>
+    dataSourceType === "local"
+      ? path.join(dataSourcePath, file)
+      : `${dataSourcePath.replace(/\/$/, "")}/${file}`;
+  const clubsPath = basePath("clubs.csv");
+  const coursesPath = basePath("courses.csv");
+  const teesPath = basePath("tees.csv");
+  const coordsPath = basePath("coordinates.csv");
+
+  if (dataSourceType === "local") {
+    for (const p of [clubsPath, coursesPath, teesPath, coordsPath]) {
+      if (!fs.existsSync(p)) {
+        throw new Error(`Missing file: ${p}`);
+      }
     }
   }
 
-  let pool = null;
-  if (!DRY_RUN && DATABASE_URL) {
-    pool = new Pool({
-      connectionString: DATABASE_URL,
-      ssl: DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false }
-    });
-  } else if (!DRY_RUN) {
-    console.error("DATABASE_URL is required for ingestion. Use --dry-run to validate without DB.");
-    process.exit(1);
+  if (!pool && !DRY_RUN) {
+    throw new Error("Pool is required for ingestion. Use --dry-run to validate without DB.");
+  }
+
+  if (pool && !DRY_RUN && !force) {
+    try {
+      const res = await pool.query("SELECT COUNT(*)::int AS n FROM golf_courses");
+      const count = res.rows[0]?.n ?? 0;
+      if (count > 0) {
+        return { skipped: true, reason: "data_exists", courseCount: count };
+      }
+    } catch {
+      /* tables may not exist yet */
+    }
   }
 
   if (DRY_RUN) {
@@ -143,7 +185,7 @@ async function runIngestion() {
 
   try {
     // --- 1. golf_clubs ---
-    const clubs = readCsv(clubsPath);
+    const clubs = await readCsv(clubsPath, dataSourceType);
     const totalClubs = clubs.length;
     for (let i = 0; i < clubs.length; i++) {
       if ((i + 1) % PROGRESS_INTERVAL === 0 || i === 0) progress("clubs.csv", i + 1, totalClubs);
@@ -199,7 +241,7 @@ async function runIngestion() {
     console.log(`\n✓ clubs: ${stats.clubs.insert} processed`);
 
     // --- 2. golf_courses ---
-    const courses = readCsv(coursesPath);
+    const courses = await readCsv(coursesPath, dataSourceType);
     const totalCourses = courses.length;
     for (let i = 0; i < courses.length; i++) {
       if ((i + 1) % PROGRESS_INTERVAL === 0 || i === 0) progress("courses.csv", i + 1, totalCourses);
@@ -290,7 +332,7 @@ async function runIngestion() {
     console.log(`\n✓ holes: ${stats.holes.insert} processed`);
 
     // --- 4. golf_tees ---
-    const tees = readCsv(teesPath);
+    const tees = await readCsv(teesPath, dataSourceType);
     const totalTees = tees.length;
     for (let i = 0; i < tees.length; i++) {
       if ((i + 1) % PROGRESS_INTERVAL === 0 || i === 0) progress("tees.csv", i + 1, totalTees);
@@ -382,7 +424,7 @@ async function runIngestion() {
 
     // --- 6. golf_hole_pois (coordinates.csv) ---
     // coordinates.csv uses CourseID (NOT ClubID). POIs are per course.
-    const coords = readCsv(coordsPath);
+    const coords = await readCsv(coordsPath, dataSourceType);
     const totalCoords = coords.length;
     for (let i = 0; i < coords.length; i++) {
       if ((i + 1) % PROGRESS_INTERVAL === 0 || i === 0) progress("coordinates.csv", i + 1, totalCoords);
@@ -417,7 +459,10 @@ async function runIngestion() {
 
       await pool.query(
         `INSERT INTO golf_hole_pois (course_id, hole_number, poi_type, location_label, fairway_side, lat, lon, location, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, ST_SetSRID(ST_MakePoint($7, $6), 4326)::geography, now())`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, ST_SetSRID(ST_MakePoint($7, $6), 4326)::geography, now())
+         ON CONFLICT (course_id, hole_number, lat, lon) DO UPDATE SET
+           poi_type = EXCLUDED.poi_type, location_label = EXCLUDED.location_label,
+           fairway_side = EXCLUDED.fairway_side, location = EXCLUDED.location, updated_at = now()`,
         [courseUuid, holeNum, poiType, locationLabel, fairwaySide, lat, lon]
       );
       stats.pois.insert++;
@@ -456,7 +501,7 @@ async function runIngestion() {
       console.log("\n[DRY RUN] Would precompute course centers from green POIs");
     }
   } finally {
-    if (pool) await pool.end();
+    if (closePool && pool) await pool.end();
   }
 
   // --- Summary ---
@@ -484,9 +529,48 @@ async function runIngestion() {
     fs.writeFileSync(errorLogPath, errorLog.map((e) => JSON.stringify(e)).join("\n"), "utf8");
     console.log(`\nErrors logged to ${errorLogPath} (${errorLog.length} entries)`);
   }
+
+  return stats;
 }
 
-runIngestion().catch((err) => {
-  console.error("Ingestion failed:", err);
-  process.exit(1);
-});
+// CLI entry point
+async function main() {
+  const dryRun = process.argv.includes("--dry-run") || process.argv.includes("-n");
+  const force = process.argv.includes("--force");
+  const dataDir = process.argv.find((a) => a.startsWith("--data-dir="))?.split("=")[1];
+
+  require("dotenv").config();
+  const DATABASE_URL = process.env.DATABASE_URL;
+
+  let pool = null;
+  if (!dryRun && DATABASE_URL) {
+    pool = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false }
+    });
+  } else if (!dryRun) {
+    console.error("DATABASE_URL is required. Use --dry-run to validate without DB.");
+    process.exit(1);
+  }
+
+  try {
+    const result = await runIngestion(pool, {
+      dataDir,
+      dryRun,
+      force,
+      closePool: true
+    });
+    if (result?.skipped) {
+      console.log(`[ingest] Skipped: ${result.reason} (${result.courseCount} courses)`);
+    }
+  } catch (err) {
+    console.error("Ingestion failed:", err.message);
+    process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = { runIngestion };

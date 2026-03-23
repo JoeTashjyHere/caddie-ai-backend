@@ -365,7 +365,36 @@ const localCourses = [
 ];
 
 app.get("/health", (req, res) => res.json({ ok: true }));
-app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+app.get("/api/health", async (req, res) => {
+  const out = { status: "ok", db: "disconnected", data: null };
+  try {
+    const pool = app.get("dbPool");
+    if (pool) {
+      const r = await pool.query("SELECT 1");
+      out.db = "connected";
+      try {
+        const [courses, holes, tees, pois] = await Promise.all([
+          pool.query("SELECT COUNT(*)::int AS n FROM golf_courses"),
+          pool.query("SELECT COUNT(*)::int AS n FROM golf_course_holes"),
+          pool.query("SELECT COUNT(*)::int AS n FROM golf_tees"),
+          pool.query("SELECT COUNT(*)::int AS n FROM golf_hole_pois")
+        ]);
+        out.data = {
+          courses: courses.rows[0]?.n ?? 0,
+          holes: holes.rows[0]?.n ?? 0,
+          tees: tees.rows[0]?.n ?? 0,
+          pois: pois.rows[0]?.n ?? 0
+        };
+      } catch {
+        out.data = { courses: 0, holes: 0, tees: 0, pois: 0 };
+      }
+    }
+  } catch {
+    out.status = "degraded";
+  }
+  res.json(out);
+});
 app.get("/version", (req, res) => res.json({ version: "2026-03-07-recommendation-events-feedback" }));
 
 function toDataUrlFromBase64(base64OrDataUrl) {
@@ -791,15 +820,39 @@ app.post("/api/openai/vision", upload.single("image"), async (req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, "0.0.0.0", async () => {
+
+async function start() {
   ensureAnalyticsDir();
+
   if (dbPool) {
     try {
+      const { runStartup } = require("./lib/init");
+      const result = await runStartup(dbPool);
+      if (result.migrations?.applied?.length > 0) {
+        console.log(`[init] Migrations applied: ${result.migrations.applied.join(", ")}`);
+      }
+      if (result.migrations?.skipped?.length > 0) {
+        console.log(`[init] Migrations skipped (already applied): ${result.migrations.skipped.length}`);
+      }
+      if (result.ingestion?.skipped) {
+        console.log(`[init] Ingestion skipped: ${result.ingestion.reason}`);
+      } else if (result.ingestion) {
+        console.log("[init] Ingestion completed");
+      }
+
       await ensureRecommendationTables();
       console.log("✅ Recommendation tables ready");
     } catch (err) {
-      console.warn("⚠️ Could not create recommendation tables:", err.message);
+      console.warn("⚠️ Init/recommendation tables:", err.message);
     }
   }
-  console.log(`✅ API running on port ${PORT}`);
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`✅ API running on port ${PORT}`);
+  });
+}
+
+start().catch((err) => {
+  console.error("Startup failed:", err);
+  process.exit(1);
 });
