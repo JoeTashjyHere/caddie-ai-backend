@@ -9,6 +9,7 @@ require("dotenv").config();
  * - Vision: POST /api/openai/vision (supports base64 JSON OR multipart file upload)
  * - Complete: POST /api/openai/complete
  * - Courses: GET /api/courses (local fallback)
+ * - Round engine: GET /api/course-context/:courseId (course + holes + tees, no POI bulk)
  * - Analytics: POST /api/analytics/events, GET /api/analytics/events/recent
  * - Recommendation analytics: POST /api/analytics/recommendation, POST /api/analytics/feedback,
  *   GET /api/analytics/recommendation/recent, GET /api/analytics/recommendation/summary
@@ -353,16 +354,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Local in-memory courses (starter list)
-const localCourses = [
-  { id: "pebble", name: "Pebble Beach Golf Links", par: 72, lat: 36.568, lon: -121.95 },
-  { id: "augusta", name: "Augusta National Golf Club", par: 72, lat: 33.502, lon: -82.021 },
-  { id: "st-andrews", name: "St. Andrews Links", par: 72, lat: 56.34, lon: -2.818 },
-  { id: "local-muni", name: "Local Public Course", par: 70, lat: 37.7749, lon: -122.4194 },
-  { id: "country-club", name: "Country Club Course", par: 71, lat: 37.7849, lon: -122.4094 },
-  { id: "riverside", name: "Riverside Golf Club", par: 72, lat: 37.7649, lon: -122.4294 },
-  { id: "mountain-view", name: "Mountain View Golf Course", par: 69, lat: 37.7549, lon: -122.4394 }
-];
+// No more hardcoded courses — all course data comes from the database.
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
@@ -412,11 +404,6 @@ function parseMaybeJSON(value) {
   } catch {
     return value;
   }
-}
-
-// Stub for later external course lookup
-async function fetchExternalCourses() {
-  return [];
 }
 
 // ----------------------------
@@ -631,49 +618,82 @@ app.post("/api/feedback/caddie", (req, res) => {
   return res.json({ ok: true });
 });
 
-// Legacy /api/courses list (exact path) - defined before router so it takes precedence
+// Database-backed /api/courses (exact path) - defined before router so sub-routes still work
 app.get("/api/courses", async (req, res) => {
+  const pool = app.get("dbPool");
+  if (!pool) {
+    return res.status(503).json({ error: "Database unavailable", courses: [] });
+  }
   try {
     const { lat, lon, query } = req.query;
+    let rows;
 
     if (query) {
-      const filtered = localCourses.filter((c) =>
-        c.name.toLowerCase().includes(String(query).toLowerCase())
+      const result = await pool.query(
+        `SELECT gc.id, gc.course_name AS name, gc.lat, gc.lon,
+                COALESCE(SUM(h.par), NULL)::int AS par
+         FROM golf_courses gc
+         LEFT JOIN golf_course_holes h ON h.course_id = gc.id
+         WHERE gc.course_name ILIKE $1
+         GROUP BY gc.id
+         ORDER BY gc.course_name
+         LIMIT 20`,
+        [`%${String(query).trim()}%`]
       );
-      if (filtered.length > 0) return res.json({ source: "local", courses: filtered });
-    }
-
-    try {
-      const externalCourses = await fetchExternalCourses(lat, lon, query);
-      if (externalCourses.length > 0) return res.json({ source: "external", courses: externalCourses });
-    } catch (err) {
-      console.error("External course lookup failed:", err.message);
-    }
-
-    let coursesToReturn = localCourses;
-
-    if (lat && lon) {
+      rows = result.rows;
+      console.log(`[COURSE] Search query="${query}" returned ${rows.length} courses from DB`);
+    } else if (lat && lon) {
       const userLat = parseFloat(lat);
       const userLon = parseFloat(lon);
-
-      coursesToReturn = localCourses
-        .filter((c) => c.lat && c.lon)
-        .map((course) => ({
-          ...course,
-          distance: Math.sqrt(Math.pow(course.lat - userLat, 2) + Math.pow(course.lon - userLon, 2))
-        }))
-        .sort((a, b) => a.distance - b.distance)
-        .map(({ distance, ...course }) => course);
+      if (isNaN(userLat) || isNaN(userLon)) {
+        return res.status(400).json({ error: "Invalid lat/lon" });
+      }
+      const result = await pool.query(
+        `SELECT gc.id, gc.course_name AS name, gc.lat, gc.lon,
+                COALESCE(SUM(h.par), NULL)::int AS par
+         FROM golf_courses gc
+         LEFT JOIN golf_course_holes h ON h.course_id = gc.id
+         WHERE gc.lat IS NOT NULL AND gc.lon IS NOT NULL
+         GROUP BY gc.id
+         ORDER BY (gc.lat - $1)*(gc.lat - $1) + (gc.lon - $2)*(gc.lon - $2)
+         LIMIT 20`,
+        [userLat, userLon]
+      );
+      rows = result.rows;
+      console.log(`[COURSE] Nearby lat=${userLat} lon=${userLon} returned ${rows.length} courses from DB`);
+    } else {
+      const result = await pool.query(
+        `SELECT gc.id, gc.course_name AS name, gc.lat, gc.lon,
+                COALESCE(SUM(h.par), NULL)::int AS par
+         FROM golf_courses gc
+         LEFT JOIN golf_course_holes h ON h.course_id = gc.id
+         GROUP BY gc.id
+         ORDER BY gc.course_name
+         LIMIT 20`
+      );
+      rows = result.rows;
+      console.log(`[COURSE] All courses returned ${rows.length} from DB`);
     }
 
-    return res.json({ source: "fallback-local", courses: coursesToReturn });
+    const courses = rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      par: r.par || null,
+      lat: r.lat != null ? Number(r.lat) : null,
+      lon: r.lon != null ? Number(r.lon) : null
+    }));
+
+    return res.json({ source: "database", courses });
   } catch (err) {
-    console.error("Error in /api/courses:", err.message);
-    return res.json({ source: "error-fallback", courses: localCourses });
+    console.error("[COURSE] Error in /api/courses:", err.message);
+    return res.status(500).json({ error: "Failed to fetch courses", courses: [] });
   }
 });
 
 // Week 1 Course routes (Google Places, matching, course intelligence)
+const courseContextRouter = require("./routes/courseContext");
+app.use("/api/course-context", courseContextRouter);
+
 const coursesRouter = require("./routes/courses");
 app.use("/api/courses", coursesRouter);
 
@@ -833,11 +853,6 @@ async function start() {
       }
       if (result.migrations?.skipped?.length > 0) {
         console.log(`[init] Migrations skipped (already applied): ${result.migrations.skipped.length}`);
-      }
-      if (result.ingestion?.skipped) {
-        console.log(`[init] Ingestion skipped: ${result.ingestion.reason}`);
-      } else if (result.ingestion) {
-        console.log("[init] Ingestion completed");
       }
 
       await ensureRecommendationTables();

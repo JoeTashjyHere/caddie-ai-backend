@@ -16,19 +16,24 @@
  * Usage:
  *   node scripts/ingest.js [--dry-run] [--data-dir=/path] [--force]
  *
- * Env: DATA_SOURCE_TYPE=local|url, DATA_SOURCE_PATH=...
+ * Env: DATA_SOURCE_PATH (URL or local path). Use --data-dir for explicit local path.
  * Programmatic: runIngestion(pool, { dataDir, dryRun, force, closePool })
  */
 
 const fs = require("fs");
 const path = require("path");
 const { parse } = require("csv-parse/sync");
+const { parse: createCsvParseStream } = require("csv-parse");
 const { Pool } = require("pg");
 const fetch = require("node-fetch");
+const { runMigrations } = require("./run-migrations");
+const { Readable } = require("stream");
 
 require("dotenv").config();
 
 const PROGRESS_INTERVAL = 5000;
+const POI_BATCH_SIZE = 1000;
+const POI_PROGRESS_INTERVAL = 10000;
 
 const errorLogPath = path.join(process.cwd(), "ingestion_errors.log");
 let errorLog = [];
@@ -78,6 +83,23 @@ function validPar(p) {
   return Number.isInteger(i) && i >= 3 && i <= 6;
 }
 
+/** True if string is an absolute URL (http/https). */
+function isAbsoluteUrl(s) {
+  return typeof s === "string" && (s.startsWith("https://") || s.startsWith("http://"));
+}
+
+/** Resolve path or URL for a CSV file. Supports both local paths and absolute URLs. */
+function resolveCsvPath(fileName, basePath, dataDir) {
+  // Explicit --data-dir as local path takes precedence
+  if (dataDir && !isAbsoluteUrl(dataDir)) {
+    return path.resolve(dataDir, fileName);
+  }
+  if (isAbsoluteUrl(basePath)) {
+    return `${basePath.replace(/\/$/, "")}/${fileName}`;
+  }
+  return path.resolve(basePath, fileName);
+}
+
 function readCsvFromFile(filePath) {
   if (!fs.existsSync(filePath)) {
     throw new Error(`File not found: ${filePath}`);
@@ -103,11 +125,39 @@ async function readCsvFromUrl(url) {
   });
 }
 
-async function readCsv(filePathOrUrl, sourceType) {
-  if (sourceType === "url") {
-    return readCsvFromUrl(filePathOrUrl);
+async function readCsv(pathOrUrl) {
+  if (isAbsoluteUrl(pathOrUrl)) {
+    return readCsvFromUrl(pathOrUrl);
   }
-  return readCsvFromFile(filePathOrUrl);
+  return readCsvFromFile(pathOrUrl);
+}
+
+/**
+ * Create a readable stream of CSV rows for coordinates.csv.
+ * Uses fs.createReadStream for local paths, fetch + stream for URLs.
+ * Does NOT load entire file into memory.
+ */
+async function createCoordinatesStream(pathOrUrl) {
+  const parser = createCsvParseStream({
+    columns: true,
+    skip_empty_lines: true,
+    relax_column_count: true,
+    trim: true
+  });
+
+  if (isAbsoluteUrl(pathOrUrl)) {
+    const res = await fetch(pathOrUrl);
+    if (!res.ok) throw new Error(`Failed to fetch ${pathOrUrl}: ${res.status}`);
+    const bodyStream = res.body && typeof res.body.pipe === "function"
+      ? res.body
+      : Readable.fromWeb(res.body);
+    bodyStream.pipe(parser);
+  } else {
+    const fileStream = fs.createReadStream(pathOrUrl);
+    fileStream.on("error", (err) => parser.destroy(err));
+    fileStream.pipe(parser);
+  }
+  return parser;
 }
 
 /**
@@ -123,23 +173,19 @@ async function readCsv(filePathOrUrl, sourceType) {
  * @returns {Promise<object>}
  */
 async function runIngestion(pool, options = {}) {
-  const dataSourceType = options.dataSourceType || process.env.DATA_SOURCE_TYPE || "local";
+  const dataDir = options.dataDir ?? null;
   const dataSourcePath =
-    options.dataDir ?? options.dataSourcePath ?? process.env.DATA_SOURCE_PATH ?? path.resolve(__dirname, "../data");
+    options.dataSourcePath ?? process.env.DATA_SOURCE_PATH ?? path.resolve(__dirname, "../data");
   const DRY_RUN = options.dryRun ?? false;
   const force = options.force ?? false;
   const closePool = options.closePool !== false;
 
-  const basePath = (file) =>
-    dataSourceType === "local"
-      ? path.join(dataSourcePath, file)
-      : `${dataSourcePath.replace(/\/$/, "")}/${file}`;
-  const clubsPath = basePath("clubs.csv");
-  const coursesPath = basePath("courses.csv");
-  const teesPath = basePath("tees.csv");
-  const coordsPath = basePath("coordinates.csv");
+  const clubsPath = resolveCsvPath("clubs.csv", dataSourcePath, dataDir);
+  const coursesPath = resolveCsvPath("courses.csv", dataSourcePath, dataDir);
+  const teesPath = resolveCsvPath("tees.csv", dataSourcePath, dataDir);
+  const coordsPath = resolveCsvPath("coordinates.csv", dataSourcePath, dataDir);
 
-  if (dataSourceType === "local") {
+  if (!isAbsoluteUrl(clubsPath)) {
     for (const p of [clubsPath, coursesPath, teesPath, coordsPath]) {
       if (!fs.existsSync(p)) {
         throw new Error(`Missing file: ${p}`);
@@ -151,12 +197,22 @@ async function runIngestion(pool, options = {}) {
     throw new Error("Pool is required for ingestion. Use --dry-run to validate without DB.");
   }
 
-  if (pool && !DRY_RUN && !force) {
+  let courseCount = 0;
+  let poiCount = 0;
+  if (pool && !DRY_RUN) {
     try {
-      const res = await pool.query("SELECT COUNT(*)::int AS n FROM golf_courses");
-      const count = res.rows[0]?.n ?? 0;
-      if (count > 0) {
-        return { skipped: true, reason: "data_exists", courseCount: count };
+      const [coursesRes, poisRes] = await Promise.all([
+        pool.query("SELECT COUNT(*)::int AS n FROM golf_courses"),
+        pool.query("SELECT COUNT(*)::int AS n FROM golf_hole_pois")
+      ]);
+      courseCount = coursesRes.rows[0]?.n ?? 0;
+      poiCount = poisRes.rows[0]?.n ?? 0;
+      // Only skip when BOTH courses and POIs exist. If pois = 0, we MUST run POI ingestion.
+      if (courseCount > 0 && poiCount > 0 && !force) {
+        return { skipped: true, reason: "data_exists", courseCount, poiCount };
+      }
+      if (courseCount > 0 && poiCount === 0) {
+        console.log("[ingest] Skipping courses but continuing POI ingestion (pois = 0)");
       }
     } catch {
       /* tables may not exist yet */
@@ -183,9 +239,26 @@ async function runIngestion(pool, options = {}) {
     teesIdToUuid: {}
   };
 
+  const skipPriorPhases = courseCount > 0 && !DRY_RUN;
+  if (skipPriorPhases) {
+    console.log("[ingest] Courses exist. Loading idMaps from DB for POI phase (POIs will NOT be skipped)...");
+    const rows = await pool.query("SELECT course_id, id, num_holes FROM golf_courses");
+    for (const r of rows.rows) {
+      idMaps.courseIdToUuid[r.course_id] = r.id;
+      idMaps.courseIdToNumHoles[r.course_id] = r.num_holes === 9 ? 9 : 18;
+    }
+    console.log(`[ingest] Loaded ${Object.keys(idMaps.courseIdToUuid).length} courses. Skipping clubs/courses/holes/tees.\n`);
+  }
+
   try {
-    // --- 1. golf_clubs ---
-    const clubs = await readCsv(clubsPath, dataSourceType);
+    // --- 1. golf_clubs (skip if courses exist) ---
+    if (skipPriorPhases) {
+      console.log("✓ clubs: skipped (data exists)");
+      console.log("✓ courses: skipped (data exists)");
+      console.log("✓ holes: skipped (data exists)");
+      console.log("✓ tees: skipped (data exists)");
+    } else {
+    const clubs = await readCsv(clubsPath);
     const totalClubs = clubs.length;
     for (let i = 0; i < clubs.length; i++) {
       if ((i + 1) % PROGRESS_INTERVAL === 0 || i === 0) progress("clubs.csv", i + 1, totalClubs);
@@ -241,7 +314,7 @@ async function runIngestion(pool, options = {}) {
     console.log(`\n✓ clubs: ${stats.clubs.insert} processed`);
 
     // --- 2. golf_courses ---
-    const courses = await readCsv(coursesPath, dataSourceType);
+    const courses = await readCsv(coursesPath);
     const totalCourses = courses.length;
     for (let i = 0; i < courses.length; i++) {
       if ((i + 1) % PROGRESS_INTERVAL === 0 || i === 0) progress("courses.csv", i + 1, totalCourses);
@@ -332,7 +405,7 @@ async function runIngestion(pool, options = {}) {
     console.log(`\n✓ holes: ${stats.holes.insert} processed`);
 
     // --- 4. golf_tees ---
-    const tees = await readCsv(teesPath, dataSourceType);
+    const tees = await readCsv(teesPath);
     const totalTees = tees.length;
     for (let i = 0; i < tees.length; i++) {
       if ((i + 1) % PROGRESS_INTERVAL === 0 || i === 0) progress("tees.csv", i + 1, totalTees);
@@ -421,30 +494,76 @@ async function runIngestion(pool, options = {}) {
     }
     if (!DRY_RUN) progress("tees.csv", totalTees, totalTees);
     console.log(`\n✓ tees: ${stats.tees.insert}, tee_hole_lengths: ${stats.teeLengths.insert}`);
+    }
 
     // --- 6. golf_hole_pois (coordinates.csv) ---
-    // coordinates.csv uses CourseID (NOT ClubID). POIs are per course.
-    const coords = await readCsv(coordsPath, dataSourceType);
-    const totalCoords = coords.length;
-    for (let i = 0; i < coords.length; i++) {
-      if ((i + 1) % PROGRESS_INTERVAL === 0 || i === 0) progress("coordinates.csv", i + 1, totalCoords);
-      const r = coords[i];
+    // Streaming: no full-file load. Batch inserts (1000 rows). Progress every 10k.
+    const coordsSource = isAbsoluteUrl(coordsPath) ? "URL" : "local file";
+    console.log(`\nStarting POI ingestion from coordinates.csv (source: ${coordsSource})`);
+    console.log(`[POI] Resolved path: ${coordsPath}`);
+    if (!isAbsoluteUrl(coordsPath) && !fs.existsSync(coordsPath)) {
+      throw new Error(`coordinates.csv not found at: ${coordsPath}`);
+    }
+    const parser = await createCoordinatesStream(coordsPath);
+    let rowNum = 1;
+    let batch = [];
+    const POI_INSERT = `INSERT INTO golf_hole_pois (course_id, hole_number, poi_type, location_label, fairway_side, lat, lon, location, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, ST_SetSRID(ST_MakePoint($7, $6), 4326)::geography, now())
+         ON CONFLICT (course_id, hole_number, lat, lon) DO UPDATE SET
+           poi_type = EXCLUDED.poi_type, location_label = EXCLUDED.location_label,
+           fairway_side = EXCLUDED.fairway_side, location = EXCLUDED.location, updated_at = now()`;
+
+    const flushBatch = async (toInsert) => {
+      if (toInsert.length === 0) return;
+      if (DRY_RUN) {
+        stats.pois.insert += toInsert.length;
+        return;
+      }
+      const client = await pool.connect();
+      try {
+        for (const row of toInsert) {
+          try {
+            await client.query(POI_INSERT, row);
+            stats.pois.insert++;
+          } catch (e) {
+            logError(rowNum, "coordinates.csv", e.message, row);
+            stats.pois.skip++;
+          }
+        }
+      } finally {
+        client.release();
+      }
+    };
+
+    let firstRowLogged = false;
+    let courseNotFoundSkips = 0;
+    for await (const r of parser) {
+      rowNum++;
+      if (!firstRowLogged && r && typeof r === "object") {
+        const keys = Object.keys(r).sort();
+        console.log(`[POI] First row headers: ${keys.join(", ")}`);
+        firstRowLogged = true;
+      }
       const courseId = trim(r.CourseID);
       const courseUuid = idMaps.courseIdToUuid[courseId];
       if (!courseUuid) {
+        courseNotFoundSkips++;
         stats.pois.skip++;
+        if (courseNotFoundSkips <= 3) {
+          console.log(`[POI] Row ${rowNum}: course not found for CourseID=${courseId || "(empty)"}`);
+        }
         continue;
       }
       const holeNum = parseInt(r.Hole, 10);
       if (!validHoleNum(holeNum)) {
-        logError(i + 2, "coordinates.csv", "invalid hole number", r);
+        logError(rowNum, "coordinates.csv", "invalid hole number", r);
         stats.pois.skip++;
         continue;
       }
       const lat = parseFloat(r.Latitude);
       const lon = parseFloat(r.Longitude);
       if (!validLat(lat) || !validLon(lon)) {
-        logError(i + 2, "coordinates.csv", "invalid lat/lon", r);
+        logError(rowNum, "coordinates.csv", "invalid lat/lon", r);
         stats.pois.skip++;
         continue;
       }
@@ -452,23 +571,20 @@ async function runIngestion(pool, options = {}) {
       const locationLabel = trim(r.Location) || null;
       const fairwaySide = trim(r.SideOfFairway) || null;
 
-      if (DRY_RUN) {
-        stats.pois.insert++;
-        continue;
+      batch.push([courseUuid, holeNum, poiType, locationLabel, fairwaySide, lat, lon]);
+      if (batch.length >= POI_BATCH_SIZE) {
+        await flushBatch(batch);
+        batch = [];
       }
-
-      await pool.query(
-        `INSERT INTO golf_hole_pois (course_id, hole_number, poi_type, location_label, fairway_side, lat, lon, location, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, ST_SetSRID(ST_MakePoint($7, $6), 4326)::geography, now())
-         ON CONFLICT (course_id, hole_number, lat, lon) DO UPDATE SET
-           poi_type = EXCLUDED.poi_type, location_label = EXCLUDED.location_label,
-           fairway_side = EXCLUDED.fairway_side, location = EXCLUDED.location, updated_at = now()`,
-        [courseUuid, holeNum, poiType, locationLabel, fairwaySide, lat, lon]
-      );
-      stats.pois.insert++;
+      if (rowNum % POI_PROGRESS_INTERVAL === 0) {
+        console.log(`[POI] Processed ${rowNum.toLocaleString()} rows, inserted ${stats.pois.insert.toLocaleString()} POIs`);
+      }
     }
-    if (!DRY_RUN) progress("coordinates.csv", totalCoords, totalCoords);
-    console.log(`\n✓ pois: ${stats.pois.insert} processed`);
+    await flushBatch(batch);
+    console.log(`\n[POI] Ingestion complete. Inserted ${stats.pois.insert.toLocaleString()} POIs (processed ${rowNum.toLocaleString()} rows)`);
+    if (courseNotFoundSkips > 0) {
+      console.log(`[POI] Warning: ${courseNotFoundSkips.toLocaleString()} rows skipped (CourseID not in golf_courses)`);
+    }
 
     // --- 7. Precompute course center from green POIs ---
     if (!DRY_RUN && pool) {
@@ -554,6 +670,20 @@ async function main() {
   }
 
   try {
+    // 1. Run migrations (ensures tables exist)
+    if (pool) {
+      console.log("[ingest] Running migrations...");
+      const migrations = await runMigrations(pool);
+      if (migrations.applied?.length > 0) {
+        console.log(`[ingest] Applied: ${migrations.applied.join(", ")}`);
+      }
+      if (migrations.skipped?.length > 0) {
+        console.log(`[ingest] Skipped (already applied): ${migrations.skipped.length}`);
+      }
+      console.log("[ingest] Migrations complete.\n");
+    }
+
+    // 2. Run ingestion pipeline
     const result = await runIngestion(pool, {
       dataDir,
       dryRun,

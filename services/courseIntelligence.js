@@ -206,11 +206,76 @@ async function getHoleLayout(pool, courseUuidOrSlug, holeNumber) {
   };
 }
 
+/**
+ * Round engine: course + holes + tees in one payload. No per-hole POI arrays (fast).
+ * Green center = AVG(lat), AVG(lon) of Green POIs per hole (matches ingestion centroids).
+ */
+async function getRoundCourseContext(pool, idOrSlug) {
+  const uuid = await resolveCourseId(pool, idOrSlug);
+  if (!uuid) return null;
+  const course = await getCourseById(pool, uuid);
+  if (!course) return null;
+
+  const holesSql = `
+    SELECT h.hole_number, h.par,
+           gg.green_lat, gg.green_lon
+    FROM golf_course_holes h
+    LEFT JOIN (
+      SELECT course_id, hole_number,
+             AVG(lat) AS green_lat,
+             AVG(lon) AS green_lon
+      FROM golf_hole_pois
+      WHERE LOWER(TRIM(poi_type)) = 'green'
+      GROUP BY course_id, hole_number
+    ) gg ON gg.course_id = h.course_id AND gg.hole_number = h.hole_number
+    WHERE h.course_id = $1
+    ORDER BY h.hole_number
+  `;
+
+  const teesSql = `
+    SELECT t.id, t.tee_name, COALESCE(SUM(l.length), 0)::bigint AS total_yards
+    FROM golf_tees t
+    LEFT JOIN golf_tee_hole_lengths l ON l.tees_id = t.id
+    WHERE t.course_id = $1
+    GROUP BY t.id, t.tee_name
+    ORDER BY t.tee_name
+  `;
+
+  const [holesRes, teesRes] = await Promise.all([
+    pool.query(holesSql, [uuid]),
+    pool.query(teesSql, [uuid])
+  ]);
+
+  return {
+    course: {
+      id: course.id,
+      name: course.course_name,
+      lat: course.lat,
+      lon: course.lon
+    },
+    holes: holesRes.rows.map((r) => ({
+      hole_number: r.hole_number,
+      par: r.par,
+      green_center:
+        r.green_lat != null && r.green_lon != null
+          ? { lat: Number(r.green_lat), lon: Number(r.green_lon) }
+          : null
+    })),
+    tees: teesRes.rows.map((r) => ({
+      id: r.id,
+      name: r.tee_name,
+      total_yards: Number(r.total_yards) || 0
+    }))
+  };
+}
+
 module.exports = {
   getCourseById,
   getFullCoursePayload,
   getTeesByCourseId,
   getTeeLengthsByTeeId,
   getHolesByCourseId,
-  getHoleLayout
+  getHoleLayout,
+  getRoundCourseContext,
+  resolveCourseId
 };
