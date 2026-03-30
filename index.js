@@ -385,9 +385,13 @@ app.get("/api/health", async (req, res) => {
   } catch {
     out.status = "degraded";
   }
+  out.version = DEPLOY_VERSION;
+  out.deployedAt = DEPLOY_TIMESTAMP;
   res.json(out);
 });
-app.get("/version", (req, res) => res.json({ version: "2026-03-07-recommendation-events-feedback" }));
+const DEPLOY_VERSION = "2026-03-29-decision-engine-hazards";
+const DEPLOY_TIMESTAMP = new Date().toISOString();
+app.get("/version", (req, res) => res.json({ version: DEPLOY_VERSION, deployedAt: DEPLOY_TIMESTAMP }));
 
 function toDataUrlFromBase64(base64OrDataUrl) {
   if (!base64OrDataUrl || typeof base64OrDataUrl !== "string") return null;
