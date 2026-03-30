@@ -618,30 +618,102 @@ app.post("/api/feedback/caddie", (req, res) => {
   return res.json({ ok: true });
 });
 
+// ---- Nine-combination normalization ----
+// Course names like "Red + White", "White + Blue" are routing combos, not real course names.
+// Merge them per club into a single entry with deduplicated tees.
+function isNineCombination(courseName) {
+  if (!courseName) return false;
+  return /^[A-Za-z\s]{1,25}\s*\+\s*[A-Za-z\s]{1,25}$/.test(courseName.trim());
+}
+
+function normalizeNineCombinations(courses) {
+  // Group by club_name
+  const clubBuckets = new Map();
+  for (const c of courses) {
+    const key = c.club_name || c.name || "";
+    if (!clubBuckets.has(key)) clubBuckets.set(key, []);
+    clubBuckets.get(key).push(c);
+  }
+
+  const result = [];
+  for (const [, clubCourses] of clubBuckets) {
+    const combos = [];
+    const regular = [];
+    for (const c of clubCourses) {
+      if (isNineCombination(c.course_name)) {
+        combos.push(c);
+      } else {
+        regular.push(c);
+      }
+    }
+
+    // Keep regular courses as-is
+    result.push(...regular);
+
+    // Merge nine-combination courses into one entry
+    if (combos.length > 0) {
+      const first = combos[0];
+      // Deduplicate tees by name, keep the one with highest yardage
+      const teeMap = {};
+      for (const c of combos) {
+        for (const t of c.tees || []) {
+          const key = t.name;
+          if (!teeMap[key] || (t.yardage || 0) > (teeMap[key].yardage || 0)) {
+            teeMap[key] = t;
+          }
+        }
+      }
+      const mergedTees = Object.values(teeMap).sort(
+        (a, b) => (b.yardage || 0) - (a.yardage || 0)
+      );
+
+      result.push({
+        id: first.id,
+        name: first.club_name || first.name,
+        club_name: first.club_name,
+        course_name: regular.length > 0 ? "Main Course" : null,
+        par: first.par,
+        lat: first.lat,
+        lon: first.lon,
+        tees: mergedTees,
+      });
+    }
+  }
+
+  return result;
+}
+
 // Database-backed /api/courses (exact path) - defined before router so sub-routes still work
 app.get("/api/courses", async (req, res) => {
+  console.log("[LIVE_COURSES] route hit");
   const pool = app.get("dbPool");
   if (!pool) {
     return res.status(503).json({ error: "Database unavailable", courses: [] });
   }
   try {
     const { lat, lon, query } = req.query;
+    console.log(`[LIVE_COURSES] query params: lat=${lat} lon=${lon} query=${query}`);
     let rows;
+
+    const courseFields = `gc.id, gc.course_name, gc.lat, gc.lon,
+                cl.name AS club_name,
+                COALESCE(cp.par, NULL)::int AS par`;
+    const courseJoins = `FROM golf_courses gc
+         JOIN golf_clubs cl ON cl.id = gc.club_id
+         LEFT JOIN (
+           SELECT course_id, SUM(par)::int AS par
+           FROM golf_course_holes GROUP BY course_id
+         ) cp ON cp.course_id = gc.id`;
 
     if (query) {
       const result = await pool.query(
-        `SELECT gc.id, gc.course_name AS name, gc.lat, gc.lon,
-                COALESCE(SUM(h.par), NULL)::int AS par
-         FROM golf_courses gc
-         LEFT JOIN golf_course_holes h ON h.course_id = gc.id
-         WHERE gc.course_name ILIKE $1
-         GROUP BY gc.id
-         ORDER BY gc.course_name
-         LIMIT 20`,
+        `SELECT ${courseFields} ${courseJoins}
+         WHERE cl.name ILIKE $1 OR gc.course_name ILIKE $1
+         ORDER BY cl.name, gc.course_name
+         LIMIT 60`,
         [`%${String(query).trim()}%`]
       );
       rows = result.rows;
-      console.log(`[COURSE] Search query="${query}" returned ${rows.length} courses from DB`);
     } else if (lat && lon) {
       const userLat = parseFloat(lat);
       const userLon = parseFloat(lon);
@@ -649,39 +721,63 @@ app.get("/api/courses", async (req, res) => {
         return res.status(400).json({ error: "Invalid lat/lon" });
       }
       const result = await pool.query(
-        `SELECT gc.id, gc.course_name AS name, gc.lat, gc.lon,
-                COALESCE(SUM(h.par), NULL)::int AS par
-         FROM golf_courses gc
-         LEFT JOIN golf_course_holes h ON h.course_id = gc.id
+        `SELECT ${courseFields} ${courseJoins}
          WHERE gc.lat IS NOT NULL AND gc.lon IS NOT NULL
-         GROUP BY gc.id
          ORDER BY (gc.lat - $1)*(gc.lat - $1) + (gc.lon - $2)*(gc.lon - $2)
-         LIMIT 20`,
+         LIMIT 60`,
         [userLat, userLon]
       );
       rows = result.rows;
-      console.log(`[COURSE] Nearby lat=${userLat} lon=${userLon} returned ${rows.length} courses from DB`);
     } else {
       const result = await pool.query(
-        `SELECT gc.id, gc.course_name AS name, gc.lat, gc.lon,
-                COALESCE(SUM(h.par), NULL)::int AS par
-         FROM golf_courses gc
-         LEFT JOIN golf_course_holes h ON h.course_id = gc.id
-         GROUP BY gc.id
-         ORDER BY gc.course_name
-         LIMIT 20`
+        `SELECT ${courseFields} ${courseJoins}
+         ORDER BY cl.name, gc.course_name
+         LIMIT 60`
       );
       rows = result.rows;
-      console.log(`[COURSE] All courses returned ${rows.length} from DB`);
     }
 
-    const courses = rows.map((r) => ({
+    console.log(`[LIVE_COURSES] courses returned: ${rows.length}`);
+
+    // Fetch tees for all returned courses in one query
+    const courseIds = rows.map((r) => r.id);
+    let teesByCourse = {};
+    if (courseIds.length > 0) {
+      const teesResult = await pool.query(
+        `SELECT t.id, t.course_id, t.tee_name,
+                COALESCE(SUM(l.length), 0)::int AS yardage
+         FROM golf_tees t
+         LEFT JOIN golf_tee_hole_lengths l ON l.tees_id = t.id
+         WHERE t.course_id = ANY($1)
+         GROUP BY t.id, t.course_id, t.tee_name
+         ORDER BY COALESCE(SUM(l.length), 0) DESC`,
+        [courseIds]
+      );
+      for (const t of teesResult.rows) {
+        if (!teesByCourse[t.course_id]) teesByCourse[t.course_id] = [];
+        teesByCourse[t.course_id].push({
+          id: t.id,
+          name: t.tee_name,
+          yardage: Number(t.yardage) || 0,
+        });
+      }
+      console.log(`[LIVE_COURSES] tees fetched for ${Object.keys(teesByCourse).length} courses`);
+    }
+
+    // Build raw course objects
+    const rawCourses = rows.map((r) => ({
       id: r.id,
-      name: r.name,
+      name: r.club_name || r.course_name,
+      club_name: r.club_name || null,
+      course_name: r.course_name || null,
       par: r.par || null,
       lat: r.lat != null ? Number(r.lat) : null,
-      lon: r.lon != null ? Number(r.lon) : null
+      lon: r.lon != null ? Number(r.lon) : null,
+      tees: teesByCourse[r.id] || [],
     }));
+
+    // Normalize: merge nine-combination courses (e.g. "Red + White") per club
+    const courses = normalizeNineCombinations(rawCourses);
 
     return res.json({ source: "database", courses });
   } catch (err) {

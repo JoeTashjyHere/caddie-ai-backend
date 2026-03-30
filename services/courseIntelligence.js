@@ -207,8 +207,9 @@ async function getHoleLayout(pool, courseUuidOrSlug, holeNumber) {
 }
 
 /**
- * Round engine: course + holes + tees in one payload. No per-hole POI arrays (fast).
- * Green center = AVG(lat), AVG(lon) of Green POIs per hole (matches ingestion centroids).
+ * Round engine: course + holes + tees + per-hole hazards in one payload.
+ * Green center = AVG(lat), AVG(lon) of Green POIs per hole.
+ * Hazards = distinct non-Green POI types per hole (Bunker, Water, etc.).
  */
 async function getRoundCourseContext(pool, idOrSlug) {
   const uuid = await resolveCourseId(pool, idOrSlug);
@@ -217,7 +218,7 @@ async function getRoundCourseContext(pool, idOrSlug) {
   if (!course) return null;
 
   const holesSql = `
-    SELECT h.hole_number, h.par,
+    SELECT h.hole_number, h.par, h.handicap,
            gg.green_lat, gg.green_lon
     FROM golf_course_holes h
     LEFT JOIN (
@@ -241,25 +242,50 @@ async function getRoundCourseContext(pool, idOrSlug) {
     ORDER BY t.tee_name
   `;
 
-  const [holesRes, teesRes] = await Promise.all([
+  const hazardsSql = `
+    SELECT hole_number,
+           INITCAP(TRIM(poi_type)) AS poi_type,
+           location_label,
+           fairway_side
+    FROM golf_hole_pois
+    WHERE course_id = $1
+      AND LOWER(TRIM(poi_type)) != 'green'
+      AND LOWER(TRIM(poi_type)) != 'tee'
+    ORDER BY hole_number, poi_type, location_label
+  `;
+
+  const [holesRes, teesRes, hazardsRes] = await Promise.all([
     pool.query(holesSql, [uuid]),
-    pool.query(teesSql, [uuid])
+    pool.query(teesSql, [uuid]),
+    pool.query(hazardsSql, [uuid])
   ]);
+
+  const hazardsByHole = {};
+  for (const r of hazardsRes.rows) {
+    if (!hazardsByHole[r.hole_number]) hazardsByHole[r.hole_number] = [];
+    const desc = buildHazardDescription(r.poi_type, r.location_label, r.fairway_side);
+    if (desc) hazardsByHole[r.hole_number].push(desc);
+  }
 
   return {
     course: {
       id: course.id,
       name: course.course_name,
       lat: course.lat,
-      lon: course.lon
+      lon: course.lon,
+      city: course.club_city || null,
+      state: course.club_state || null,
+      clubName: course.club_name || null
     },
     holes: holesRes.rows.map((r) => ({
       hole_number: r.hole_number,
       par: r.par,
+      handicap: r.handicap || null,
       green_center:
         r.green_lat != null && r.green_lon != null
           ? { lat: Number(r.green_lat), lon: Number(r.green_lon) }
-          : null
+          : null,
+      hazards: hazardsByHole[r.hole_number] || []
     })),
     tees: teesRes.rows.map((r) => ({
       id: r.id,
@@ -267,6 +293,19 @@ async function getRoundCourseContext(pool, idOrSlug) {
       total_yards: Number(r.total_yards) || 0
     }))
   };
+}
+
+function buildHazardDescription(poiType, locationLabel, fairwaySide) {
+  const type = (poiType || "").trim();
+  if (!type) return null;
+  const parts = [type];
+  if (fairwaySide && fairwaySide.trim()) {
+    parts.push(fairwaySide.trim().toLowerCase());
+  }
+  if (locationLabel && locationLabel.trim() && locationLabel.trim() !== "C") {
+    parts.push(`(${locationLabel.trim()})`);
+  }
+  return parts.join(" ");
 }
 
 module.exports = {
