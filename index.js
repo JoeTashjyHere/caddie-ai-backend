@@ -389,7 +389,7 @@ app.get("/api/health", async (req, res) => {
   out.deployedAt = DEPLOY_TIMESTAMP;
   res.json(out);
 });
-const DEPLOY_VERSION = "2026-04-16-tee-synthesis-admin-audit";
+const DEPLOY_VERSION = "2026-04-16-nonblocking-startup";
 const DEPLOY_TIMESTAMP = new Date().toISOString();
 app.get("/version", (req, res) => res.json({ version: DEPLOY_VERSION, deployedAt: DEPLOY_TIMESTAMP }));
 
@@ -944,33 +944,65 @@ app.post("/api/openai/vision", upload.single("image"), async (req, res) => {
 
 const PORT = process.env.PORT || 8080;
 
-async function start() {
-  ensureAnalyticsDir();
+function startServer() {
+  console.log("[SERVER] starting");
 
-  if (dbPool) {
-    try {
-      const { runStartup } = require("./lib/init");
-      const result = await runStartup(dbPool);
-      if (result.migrations?.applied?.length > 0) {
-        console.log(`[init] Migrations applied: ${result.migrations.applied.join(", ")}`);
-      }
-      if (result.migrations?.skipped?.length > 0) {
-        console.log(`[init] Migrations skipped (already applied): ${result.migrations.skipped.length}`);
-      }
-
-      await ensureRecommendationTables();
-      console.log("✅ Recommendation tables ready");
-    } catch (err) {
-      console.warn("⚠️ Init/recommendation tables:", err.message);
-    }
+  try {
+    ensureAnalyticsDir();
+  } catch (err) {
+    console.warn("[SERVER] ensureAnalyticsDir failed:", err.message);
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`✅ API running on port ${PORT}`);
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[SERVER] listening on port ${PORT}`);
   });
+
+  server.on("error", (err) => {
+    console.error("[SERVER ERROR] listen failed:", err.message);
+    process.exit(1);
+  });
+
+  runInitTasksInBackground();
 }
 
-start().catch((err) => {
+function runInitTasksInBackground() {
+  setTimeout(async () => {
+    console.log("[INIT] starting");
+    if (!dbPool) {
+      console.warn("[INIT] no DB pool — skipping migrations, synthesis, recommendation tables");
+      return;
+    }
+
+    try {
+      const { runInitTasksInBackground: runDbInit } = require("./lib/init");
+      // runDbInit schedules its own work on the next tick; we just kick it off.
+      runDbInit(dbPool);
+    } catch (err) {
+      console.error("[INIT ERROR] loading lib/init failed:", err.message);
+    }
+
+    try {
+      await ensureRecommendationTables();
+      console.log("[INIT] recommendation tables ready");
+    } catch (err) {
+      console.warn("[INIT] recommendation tables skipped:", err.message);
+    }
+
+    console.log("[INIT] foreground scheduling complete");
+  }, 0);
+}
+
+startServer();
+
+process.on("unhandledRejection", (err) => {
+  console.error("[PROCESS] unhandledRejection:", err?.message || err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[PROCESS] uncaughtException:", err?.message || err);
+});
+
+// Legacy no-op catch retained for file history
+Promise.resolve().catch((err) => {
   console.error("Startup failed:", err);
   process.exit(1);
 });
