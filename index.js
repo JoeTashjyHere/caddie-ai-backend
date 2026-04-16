@@ -389,7 +389,7 @@ app.get("/api/health", async (req, res) => {
   out.deployedAt = DEPLOY_TIMESTAMP;
   res.json(out);
 });
-const DEPLOY_VERSION = "2026-03-29-decision-engine-hazards";
+const DEPLOY_VERSION = "2026-04-16-tee-synthesis-admin-audit";
 const DEPLOY_TIMESTAMP = new Date().toISOString();
 app.get("/version", (req, res) => res.json({ version: DEPLOY_VERSION, deployedAt: DEPLOY_TIMESTAMP }));
 
@@ -796,6 +796,9 @@ app.use("/api/course-context", courseContextRouter);
 
 const coursesRouter = require("./routes/courses");
 app.use("/api/courses", coursesRouter);
+
+const adminRouter = require("./routes/admin");
+app.use("/api/admin", adminRouter);
 
 // Text-only OpenAI endpoint
 app.post("/api/openai/complete", async (req, res) => {

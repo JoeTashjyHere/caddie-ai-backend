@@ -208,8 +208,12 @@ async function getHoleLayout(pool, courseUuidOrSlug, holeNumber) {
 
 /**
  * Round engine: course + holes + tees + per-hole hazards in one payload.
- * Green center = AVG(lat), AVG(lon) of Green POIs per hole.
- * Hazards = distinct non-Green POI types per hole (Bunker, Water, etc.).
+ *
+ * Hole geometry is now tee-specific:
+ *   - Per-tee coordinates from golf_hole_tees (synthesized from POI + yardage)
+ *   - Green front/center/back from golf_hole_pois
+ *   - Hazards as raw POIs (tee-relative computation available client-side)
+ *   - Legacy tee_front/tee_back kept for backward compat
  */
 async function getRoundCourseContext(pool, idOrSlug) {
   const uuid = await resolveCourseId(pool, idOrSlug);
@@ -234,37 +238,132 @@ async function getRoundCourseContext(pool, idOrSlug) {
   `;
 
   const teesSql = `
-    SELECT t.id, t.tee_name, COALESCE(SUM(l.length), 0)::bigint AS total_yards
+    SELECT t.id, t.tee_name, t.slope, t.course_rating,
+           COALESCE(SUM(l.length), 0)::bigint AS total_yards
     FROM golf_tees t
     LEFT JOIN golf_tee_hole_lengths l ON l.tees_id = t.id
     WHERE t.course_id = $1
-    GROUP BY t.id, t.tee_name
-    ORDER BY t.tee_name
+    GROUP BY t.id, t.tee_name, t.slope, t.course_rating
+    ORDER BY total_yards DESC
   `;
 
   const hazardsSql = `
     SELECT hole_number,
-           INITCAP(TRIM(poi_type)) AS poi_type,
+           TRIM(poi_type) AS poi_type,
            location_label,
-           fairway_side
+           fairway_side,
+           lat, lon
     FROM golf_hole_pois
     WHERE course_id = $1
-      AND LOWER(TRIM(poi_type)) != 'green'
-      AND LOWER(TRIM(poi_type)) != 'tee'
+      AND LOWER(TRIM(poi_type)) NOT IN ('green', 'tee', 'tee front', 'tee back')
     ORDER BY hole_number, poi_type, location_label
   `;
 
-  const [holesRes, teesRes, hazardsRes] = await Promise.all([
+  // Green geometry POIs: front/center/back
+  const greenGeomSql = `
+    SELECT hole_number,
+           UPPER(TRIM(COALESCE(location_label, ''))) AS loc,
+           lat, lon
+    FROM golf_hole_pois
+    WHERE course_id = $1
+      AND LOWER(TRIM(poi_type)) = 'green'
+    ORDER BY hole_number, location_label
+  `;
+
+  // Per-tee per-hole coordinates from golf_hole_tees
+  const holeTeesSql = `
+    SELECT ht.hole_number, ht.tee_set_id, ht.tee_name,
+           ht.lat, ht.lon, ht.yardage, ht.is_synthesized
+    FROM golf_hole_tees ht
+    WHERE ht.course_id = $1
+    ORDER BY ht.hole_number, ht.tee_name
+  `;
+
+  // Legacy tee POIs (fallback if golf_hole_tees not populated)
+  const legacyTeeSql = `
+    SELECT hole_number,
+           LOWER(TRIM(poi_type)) AS poi_type,
+           lat, lon
+    FROM golf_hole_pois
+    WHERE course_id = $1
+      AND LOWER(TRIM(poi_type)) IN ('tee', 'tee front', 'tee back')
+    ORDER BY hole_number
+  `;
+
+  // Check if golf_hole_tees table exists
+  let hasHoleTeesTable = false;
+  try {
+    await pool.query("SELECT 1 FROM golf_hole_tees LIMIT 0");
+    hasHoleTeesTable = true;
+  } catch { /* table doesn't exist yet */ }
+
+  const queries = [
     pool.query(holesSql, [uuid]),
     pool.query(teesSql, [uuid]),
-    pool.query(hazardsSql, [uuid])
-  ]);
+    pool.query(hazardsSql, [uuid]),
+    pool.query(greenGeomSql, [uuid]),
+    pool.query(legacyTeeSql, [uuid])
+  ];
+  if (hasHoleTeesTable) {
+    queries.push(pool.query(holeTeesSql, [uuid]));
+  }
 
-  const hazardsByHole = {};
+  const results = await Promise.all(queries);
+  const [holesRes, teesRes, hazardsRes, greenGeomRes, legacyTeeRes] = results;
+  const holeTeesRes = hasHoleTeesTable ? results[5] : { rows: [] };
+
+  // Index raw hazard POIs by hole (with lat/lon for client-side computation)
+  const rawHazardsByHole = {};
+  const hazardDescsByHole = {};
   for (const r of hazardsRes.rows) {
-    if (!hazardsByHole[r.hole_number]) hazardsByHole[r.hole_number] = [];
+    if (!rawHazardsByHole[r.hole_number]) rawHazardsByHole[r.hole_number] = [];
+    rawHazardsByHole[r.hole_number].push({
+      type: r.poi_type,
+      location_label: r.location_label || null,
+      fairway_side: r.fairway_side || null,
+      lat: Number(r.lat),
+      lon: Number(r.lon)
+    });
+    if (!hazardDescsByHole[r.hole_number]) hazardDescsByHole[r.hole_number] = [];
     const desc = buildHazardDescription(r.poi_type, r.location_label, r.fairway_side);
-    if (desc) hazardsByHole[r.hole_number].push(desc);
+    if (desc) hazardDescsByHole[r.hole_number].push(desc);
+  }
+
+  // Index green geometry by hole
+  const greenByHole = {};
+  for (const r of greenGeomRes.rows) {
+    if (!greenByHole[r.hole_number]) greenByHole[r.hole_number] = {};
+    const g = greenByHole[r.hole_number];
+    const coord = { lat: Number(r.lat), lon: Number(r.lon) };
+    if (r.loc === "C") g.center = coord;
+    else if (r.loc === "F") g.front = coord;
+    else if (r.loc === "B") g.back = coord;
+    else if (!g.center) g.center = coord; // first green POI as fallback center
+  }
+
+  // Index per-tee coordinates by hole → tee_set_id
+  const holeTeesByHole = {};
+  for (const r of holeTeesRes.rows) {
+    if (!holeTeesByHole[r.hole_number]) holeTeesByHole[r.hole_number] = [];
+    holeTeesByHole[r.hole_number].push({
+      tee_set_id: r.tee_set_id,
+      tee_name: r.tee_name,
+      coordinate: { lat: Number(r.lat), lon: Number(r.lon) },
+      yardage: r.yardage,
+      is_synthesized: r.is_synthesized
+    });
+  }
+
+  // Index legacy tee POIs by hole (fallback)
+  const legacyTeeByHole = {};
+  for (const r of legacyTeeRes.rows) {
+    if (!legacyTeeByHole[r.hole_number]) legacyTeeByHole[r.hole_number] = {};
+    const h = legacyTeeByHole[r.hole_number];
+    const coord = { lat: Number(r.lat), lon: Number(r.lon) };
+    if (r.poi_type === "tee front" || r.poi_type === "tee") {
+      if (!h.tee_front) h.tee_front = coord;
+    }
+    if (r.poi_type === "tee back") h.tee_back = coord;
   }
 
   return {
@@ -277,21 +376,110 @@ async function getRoundCourseContext(pool, idOrSlug) {
       state: course.club_state || null,
       clubName: course.club_name || null
     },
-    holes: holesRes.rows.map((r) => ({
-      hole_number: r.hole_number,
-      par: r.par,
-      handicap: r.handicap || null,
-      green_center:
-        r.green_lat != null && r.green_lon != null
-          ? { lat: Number(r.green_lat), lon: Number(r.green_lon) }
-          : null,
-      hazards: hazardsByHole[r.hole_number] || []
-    })),
+    holes: holesRes.rows.map((r) => {
+      const green = greenByHole[r.hole_number] || {};
+      const legacy = legacyTeeByHole[r.hole_number] || {};
+
+      // Green center: prefer explicit Center POI, then AVG
+      const greenCenter = green.center
+        || (r.green_lat != null && r.green_lon != null
+            ? { lat: Number(r.green_lat), lon: Number(r.green_lon) }
+            : null);
+
+      const holeTees = holeTeesByHole[r.hole_number] || [];
+      const geometryQuality = assessGeometryQuality(greenCenter, holeTees, legacy);
+
+      return {
+        hole_number: r.hole_number,
+        par: r.par,
+        handicap: r.handicap || null,
+        green: {
+          center: greenCenter,
+          front: green.front || null,
+          back: green.back || null
+        },
+        // Per-tee coordinates (from golf_hole_tees)
+        tees: holeTees,
+        // Legacy fallback: generic tee POIs (for backward compat)
+        tee_front: legacy.tee_front || null,
+        tee_back: legacy.tee_back || null,
+        // Backward-compat flat field
+        green_center: greenCenter,
+        green_front: green.front || null,
+        green_back: green.back || null,
+        // Raw hazard POIs (for tee-relative client-side computation)
+        hazard_pois: rawHazardsByHole[r.hole_number] || [],
+        // Legacy text descriptions
+        hazards: hazardDescsByHole[r.hole_number] || [],
+        // Geometry quality audit
+        geometry_quality: geometryQuality
+      };
+    }),
     tees: teesRes.rows.map((r) => ({
       id: r.id,
       name: r.tee_name,
-      total_yards: Number(r.total_yards) || 0
+      total_yards: Number(r.total_yards) || 0,
+      slope: r.slope || null,
+      course_rating: r.course_rating ? Number(r.course_rating) : null
     }))
+  };
+}
+
+// ── Bearing math (matches iOS DistanceEngine.bearingDegrees) ──
+
+function toRad(deg) { return deg * Math.PI / 180; }
+function toDeg(rad) { return rad * 180 / Math.PI; }
+
+function bearingDeg(lat1, lon1, lat2, lon2) {
+  const φ1 = toRad(lat1), φ2 = toRad(lat2);
+  const Δλ = toRad(lon2 - lon1);
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+
+/**
+ * Assess geometry quality for a hole.
+ *
+ * teeAnchorQuality:     REAL | SYNTH_FROM_POI | SYNTH_FALLBACK
+ * bearingQuality:       VALID_REAL | VALID_SYNTH | FALLBACK_NORTH | INVALID
+ * mapAlignmentReady:    true if tee/green geometry supports accurate rendering
+ */
+function assessGeometryQuality(greenCenter, holeTees, legacyTee) {
+  const hasGreen = !!greenCenter;
+  const hasLegacyPoi = !!(legacyTee.tee_front || legacyTee.tee_back);
+  const hasHoleTees = holeTees && holeTees.length > 0;
+  const allSynth = hasHoleTees && holeTees.every(t => t.is_synthesized);
+
+  let teeAnchorQuality, bearingQuality;
+  if (!hasHoleTees && !hasLegacyPoi) {
+    teeAnchorQuality = "SYNTH_FALLBACK";
+    bearingQuality = hasGreen ? "FALLBACK_NORTH" : "INVALID";
+  } else if (!hasHoleTees || allSynth) {
+    teeAnchorQuality = hasLegacyPoi ? "SYNTH_FROM_POI" : "SYNTH_FALLBACK";
+    bearingQuality = hasGreen ? (hasLegacyPoi ? "VALID_SYNTH" : "FALLBACK_NORTH") : "INVALID";
+  } else {
+    teeAnchorQuality = "REAL";
+    bearingQuality = hasGreen ? "VALID_REAL" : "INVALID";
+  }
+
+  const mapAlignmentReady = hasGreen && bearingQuality !== "INVALID" && bearingQuality !== "FALLBACK_NORTH";
+
+  let computedBearing = null;
+  if (hasGreen) {
+    const tee = hasHoleTees
+      ? holeTees[0].coordinate
+      : (legacyTee.tee_front || legacyTee.tee_back || null);
+    if (tee) {
+      computedBearing = Math.round(bearingDeg(tee.lat, tee.lon, greenCenter.lat, greenCenter.lon) * 10) / 10;
+    }
+  }
+
+  return {
+    tee_anchor_quality: teeAnchorQuality,
+    bearing_quality: bearingQuality,
+    map_alignment_ready: mapAlignmentReady,
+    computed_bearing: computedBearing
   };
 }
 
@@ -316,5 +504,7 @@ module.exports = {
   getHolesByCourseId,
   getHoleLayout,
   getRoundCourseContext,
-  resolveCourseId
+  resolveCourseId,
+  assessGeometryQuality,
+  bearingDeg
 };

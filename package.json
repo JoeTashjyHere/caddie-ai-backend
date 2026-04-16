@@ -10,7 +10,9 @@
     "ingest:dry": "node scripts/ingest.js --dry-run",
     "migrate": "node scripts/run-migrations.js",
     "validate": "node scripts/validate-ingestion.js",
-    "extract-data": "node scripts/extract-course-data.js"
+    "extract-data": "node scripts/extract-course-data.js",
+    "synthesize": "node scripts/synthesize-hole-tees.js",
+    "synthesize:dry": "node scripts/synthesize-hole-tees.js --dry-run"
   },
   "engines": {
     "node": ">=18.0.0"
