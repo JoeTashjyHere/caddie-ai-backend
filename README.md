@@ -104,5 +104,84 @@ Should return: `{"status":"ok"}`
 
 Press `Ctrl+C` in the terminal where the server is running.
 
+---
+
+## OSM Hazard Enrichment Operator Runbook
+
+The hazard recommendation engine depends on per-hole hazard POIs. The
+source CSV covers ~9% of courses. The other ~17,000 courses are enriched
+from OpenStreetMap with full provenance (`source_type='source_osm'`,
+confidence < 1.0, `osm_id`, `osm_tags`).
+
+### Tools
+
+| Tool | When to use |
+|------|------------|
+| `npm run osm:audit` | Inspect coverage health at any time. Read-only. |
+| `npm run osm:batch:dry -- --limit=N` | Preview the next N courses the queue would enrich. No DB writes. |
+| `npm run osm:batch:apply -- --limit=N` | Real enrichment for the next N weakest courses. |
+| `POST /api/admin/enrich-osm/:courseId?apply=1` | Enrich a single course on demand (e.g. when a user reports missing hazards). |
+| `POST /api/admin/osm-batch?limit=N&apply=1` | **Bounded** batch trigger (≤10 courses, 90 s) for sanity checks. NOT for production scale. |
+| `GET  /api/admin/osm-batch-status` | Run history, queue depth, source breakdown. Read-only. |
+
+### Recommended rollout
+
+1. **Dry preview** the next 25 courses:
+   ```bash
+   DATABASE_URL=postgres://... npm run osm:batch:dry -- --limit=25
+   ```
+
+2. **Small first wave** (real writes):
+   ```bash
+   DATABASE_URL=postgres://... npm run osm:batch:apply -- --limit=25
+   ```
+   ~1 min run time. Validates the production DB connection and Overpass
+   access end-to-end.
+
+3. **Steady-state batches** of 200–500:
+   ```bash
+   DATABASE_URL=postgres://... node scripts/osm-enrich-batch.js \
+     --limit=500 --apply --delay-ms=1500 --max-queries-per-run=2000
+   ```
+   ~12.5 min per 500 courses. The `--max-queries-per-run` cap pauses
+   the run cleanly so you can chain multiple batches without exceeding
+   Overpass's 10,000 queries/day soft limit.
+
+4. **Resume after interruption**: just re-run the same command. Already-
+   successful courses are excluded automatically (14-day cooldown). To
+   force a retry of failed courses, pass `--retry-failed`.
+
+### Safety guarantees
+
+- Default mode is **dry**. `--apply` is required to write.
+- Sequential by default (no Overpass parallelism).
+- Exponential backoff on 429/504/timeout: 5 s → 15 s → 45 s.
+- `--max-queries-per-run` hard caps Overpass usage per invocation.
+- Native source data is **never overwritten**; OSM data is only added
+  when no native hazard of the same coarse category exists within 15 y.
+- Every run and every course attempt is durably persisted in
+  `osm_enrichment_runs` / `osm_enrichment_attempts` so the script
+  survives Render redeploys, Ctrl-C, and operator handoff.
+
+### Tuning knobs
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--limit=N` | 25 | Max courses to process this run. |
+| `--max-score=N` | 50 | Skip courses already at this score or higher. |
+| `--min-score=N` | -1 | Lower bound; rarely needed. |
+| `--delay-ms=N` | 1500 | Inter-Overpass-call pause. |
+| `--max-queries-per-run=N` | 2000 | Hard cap on Overpass calls per run. |
+| `--cooldown-days=N` | 14 | Successful courses stay out of the queue this long. |
+| `--retry-failed` | off | Force re-attempt of recently-failed courses. |
+| `--course-id=UUID` | – | Single-course escape hatch via the batch script. |
+
+### Future hooks
+
+When `rounds_played_30d` becomes available, the priority formula
+becomes `(1 - score/100) × max(rounds, 1)` — the field hook is already
+documented in `scripts/osm-enrich-batch.js`. Until then, weakest score
++ most holes + name (deterministic) is the queue order.
+
 
 
