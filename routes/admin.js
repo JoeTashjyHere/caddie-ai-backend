@@ -3,6 +3,8 @@
 const express = require("express");
 const router = express.Router();
 
+const { buildCoverageReport, rankWeakest, rankStrongest } = require("../scripts/audit-hazard-coverage");
+
 router.get("/dashboard", async (req, res) => {
   const pool = req.app.get("dbPool");
 
@@ -18,6 +20,13 @@ router.get("/dashboard", async (req, res) => {
     totalRecommendations: 0,
     normalizationRate: 0,
     fallbackRate: 0,
+    // Shot-outcome aggregates (P2 — structured outcomes). Computed cheaply over the
+    // shot_outcomes table; safe-fallback to zeros when the table is missing.
+    totalShotOutcomes: 0,
+    shotSuccessRate: 0,
+    dominantMissDirection: null,
+    missDirectionCounts: { left: 0, right: 0, short: 0, long: 0 },
+    topClubMissPatterns: [],
   };
 
   if (!pool) {
@@ -78,10 +87,156 @@ router.get("/dashboard", async (req, res) => {
       result.avgRoundsPerUser = result.totalRounds / result.totalUsers;
     }
 
+    // ── Shot outcome aggregates ────────────────────────────────────────────
+    // Scoped to last 90 days so the dashboard reflects recent learning patterns
+    // rather than getting drowned by long-tail historical data.
+    const ninetyDaysAgo = new Date(now - 90 * 24 * 60 * 60 * 1000).toISOString();
+    try {
+      const so = await pool.query(
+        `SELECT
+            COUNT(*)::int                                                           AS total,
+            COUNT(*) FILTER (WHERE success)::int                                     AS successes,
+            COUNT(*) FILTER (WHERE miss_direction = 'left')::int                     AS miss_left,
+            COUNT(*) FILTER (WHERE miss_direction = 'right')::int                    AS miss_right,
+            COUNT(*) FILTER (WHERE miss_direction = 'short')::int                    AS miss_short,
+            COUNT(*) FILTER (WHERE miss_direction = 'long')::int                     AS miss_long
+         FROM shot_outcomes
+         WHERE recorded_at >= $1`,
+        [ninetyDaysAgo]
+      );
+      const row = so.rows[0] || {};
+      result.totalShotOutcomes = row.total || 0;
+      result.shotSuccessRate   = row.total > 0 ? row.successes / row.total : 0;
+      result.missDirectionCounts = {
+        left:  row.miss_left  || 0,
+        right: row.miss_right || 0,
+        short: row.miss_short || 0,
+        long:  row.miss_long  || 0
+      };
+      const dominantPair = Object.entries(result.missDirectionCounts)
+        .sort((a, b) => b[1] - a[1])[0];
+      result.dominantMissDirection = (dominantPair && dominantPair[1] > 0) ? dominantPair[0] : null;
+
+      const clubAgg = await pool.query(
+        `SELECT
+            club_used,
+            COUNT(*)::int                                       AS total,
+            COUNT(*) FILTER (WHERE NOT success)::int            AS misses,
+            COUNT(*) FILTER (WHERE miss_direction = 'left')::int  AS miss_left,
+            COUNT(*) FILTER (WHERE miss_direction = 'right')::int AS miss_right
+         FROM shot_outcomes
+         WHERE club_used IS NOT NULL AND recorded_at >= $1
+         GROUP BY club_used
+         HAVING COUNT(*) >= 3
+         ORDER BY (COUNT(*) FILTER (WHERE NOT success))::float / NULLIF(COUNT(*), 0) DESC, COUNT(*) DESC
+         LIMIT 8`,
+        [ninetyDaysAgo]
+      );
+      result.topClubMissPatterns = clubAgg.rows.map((r) => ({
+        clubUsed: r.club_used,
+        total: r.total,
+        missRate: r.total > 0 ? r.misses / r.total : 0,
+        leftPct:  r.total > 0 ? r.miss_left  / r.total : 0,
+        rightPct: r.total > 0 ? r.miss_right / r.total : 0,
+      }));
+    } catch (err) {
+      // Table missing or query error — leave fields at their zero defaults.
+      console.warn("[ADMIN] shot_outcomes aggregate skipped:", err.message);
+    }
+
     return res.json(result);
   } catch (err) {
     console.error("[ADMIN] Dashboard error:", err.message);
     return res.status(500).json({ error: "Dashboard query failed" });
+  }
+});
+
+// ── Shot-outcome drill-down (founder analytics) ──
+//
+// Per-club, per-miss-side, per-user breakdowns over the last N days. Useful for
+// spotting users with the strongest miss tendencies (potential personalization wins).
+router.get("/shot-outcomes/summary", async (req, res) => {
+  const pool = req.app.get("dbPool");
+  if (!pool) return res.json({ ok: true, source: "no-db", clubs: [], topMissUsers: [], byHolePar: [] });
+
+  const days = Math.min(Math.max(parseInt(req.query.days || "90", 10) || 90, 7), 365);
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+  try {
+    const [clubs, users, byPar] = await Promise.all([
+      pool.query(
+        `SELECT club_used,
+                COUNT(*)::int                                            AS total,
+                COUNT(*) FILTER (WHERE success)::int                     AS successes,
+                COUNT(*) FILTER (WHERE miss_direction = 'left')::int     AS miss_left,
+                COUNT(*) FILTER (WHERE miss_direction = 'right')::int    AS miss_right,
+                COUNT(*) FILTER (WHERE miss_direction = 'short')::int    AS miss_short,
+                COUNT(*) FILTER (WHERE miss_direction = 'long')::int     AS miss_long
+         FROM shot_outcomes
+         WHERE club_used IS NOT NULL AND recorded_at >= $1
+         GROUP BY club_used
+         ORDER BY total DESC
+         LIMIT 30`,
+        [since]
+      ),
+      pool.query(
+        `SELECT user_id,
+                COUNT(*)::int                                            AS total,
+                COUNT(*) FILTER (WHERE success)::int                     AS successes,
+                MODE() WITHIN GROUP (ORDER BY miss_direction)            AS dominant_miss,
+                COUNT(*) FILTER (WHERE miss_direction = 'left')::int     AS miss_left,
+                COUNT(*) FILTER (WHERE miss_direction = 'right')::int    AS miss_right
+         FROM shot_outcomes
+         WHERE user_id IS NOT NULL AND recorded_at >= $1
+         GROUP BY user_id
+         HAVING COUNT(*) >= 5
+         ORDER BY (COUNT(*) FILTER (WHERE NOT success))::float / NULLIF(COUNT(*), 0) DESC, COUNT(*) DESC
+         LIMIT 20`,
+        [since]
+      ),
+      pool.query(
+        `SELECT hole_par,
+                COUNT(*)::int                                            AS total,
+                COUNT(*) FILTER (WHERE success)::int                     AS successes
+         FROM shot_outcomes
+         WHERE hole_par IS NOT NULL AND recorded_at >= $1
+         GROUP BY hole_par
+         ORDER BY hole_par`,
+        [since]
+      )
+    ]);
+
+    return res.json({
+      ok: true,
+      source: "database",
+      windowDays: days,
+      clubs: clubs.rows.map((r) => ({
+        clubUsed: r.club_used,
+        total: r.total,
+        successRate: r.total > 0 ? r.successes / r.total : 0,
+        missLeftPct:  r.total > 0 ? r.miss_left  / r.total : 0,
+        missRightPct: r.total > 0 ? r.miss_right / r.total : 0,
+        missShortPct: r.total > 0 ? r.miss_short / r.total : 0,
+        missLongPct:  r.total > 0 ? r.miss_long  / r.total : 0,
+      })),
+      topMissUsers: users.rows.map((r) => ({
+        userId: r.user_id,
+        total: r.total,
+        successRate: r.total > 0 ? r.successes / r.total : 0,
+        dominantMiss: r.dominant_miss,
+        missLeftPct:  r.total > 0 ? r.miss_left  / r.total : 0,
+        missRightPct: r.total > 0 ? r.miss_right / r.total : 0,
+      })),
+      byHolePar: byPar.rows.map((r) => ({
+        par: r.hole_par,
+        total: r.total,
+        successRate: r.total > 0 ? r.successes / r.total : 0,
+      }))
+    });
+  } catch (err) {
+    // Likely table-missing — return empty but ok so the dashboard renders.
+    console.warn("[ADMIN] shot-outcomes/summary fallback:", err.message);
+    return res.json({ ok: true, source: "fallback", clubs: [], topMissUsers: [], byHolePar: [], windowDays: days });
   }
 });
 
@@ -266,6 +421,41 @@ router.get("/geometry-health", async (req, res) => {
 });
 
 // ── On-demand tee synthesis trigger ──────────────────────────────────────────
+//
+// Behavior:
+//   - With `courseId`: runs synchronously (bounded work, short request).
+//   - Without `courseId` (full repopulate): accepts the request, returns 202 with a jobId,
+//     runs synthesis in the background. Status is tracked in-memory via `synthesisJobs`.
+//
+// In-memory job store is intentional: this is an admin-only endpoint, the job is idempotent,
+// and server restarts are acceptable (Render will just lose state; the next invocation
+// starts a fresh job).
+
+const { randomUUID } = require("crypto");
+
+/**
+ * @type {Map<string, {
+ *   id: string,
+ *   status: 'queued' | 'running' | 'completed' | 'failed',
+ *   startedAt: string,
+ *   finishedAt: string | null,
+ *   stats: object | null,
+ *   error: string | null,
+ *   courseId: string | null
+ * }>}
+ */
+const synthesisJobs = new Map();
+const SYNTHESIS_JOB_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+function pruneSynthesisJobs() {
+  const now = Date.now();
+  for (const [jobId, job] of synthesisJobs.entries()) {
+    const finishedAt = job.finishedAt ? Date.parse(job.finishedAt) : null;
+    if (finishedAt && now - finishedAt > SYNTHESIS_JOB_TTL_MS) {
+      synthesisJobs.delete(jobId);
+    }
+  }
+}
 
 router.post("/synthesize-tees", async (req, res) => {
   const pool = req.app.get("dbPool");
@@ -277,20 +467,71 @@ router.post("/synthesize-tees", async (req, res) => {
     const { runSynthesis } = require("../scripts/synthesize-hole-tees");
     const { resolveCourseId } = require("../services/courseIntelligence");
     let courseId = req.body?.courseId || req.query?.courseId || null;
+
     if (courseId) {
+      // Scoped synthesis: short, run synchronously so callers get the full result inline.
       const resolved = await resolveCourseId(pool, courseId);
       if (!resolved) {
         return res.status(404).json({ error: `Course not found: ${courseId}` });
       }
       courseId = resolved;
+      console.log(`[ADMIN] Triggering tee synthesis for course ${courseId}...`);
+      const stats = await runSynthesis(pool, { courseId });
+      return res.json({ ok: true, mode: "sync", stats });
     }
-    console.log(`[ADMIN] Triggering tee synthesis${courseId ? ` for course ${courseId}` : " (all courses)"}...`);
-    const stats = await runSynthesis(pool, { courseId });
-    return res.json({ ok: true, stats });
+
+    // Full synthesis across ~19k courses: MUST be async. Return 202 + jobId immediately.
+    pruneSynthesisJobs();
+    const jobId = randomUUID();
+    const now = new Date().toISOString();
+    synthesisJobs.set(jobId, {
+      id: jobId,
+      status: "queued",
+      startedAt: now,
+      finishedAt: null,
+      stats: null,
+      error: null,
+      courseId: null
+    });
+
+    // Fire-and-forget. Wrapped so a throw never escapes to the event loop.
+    setImmediate(async () => {
+      const job = synthesisJobs.get(jobId);
+      if (!job) return;
+      job.status = "running";
+      console.log(`[ADMIN] [SYNTHESIS JOB ${jobId}] starting (all courses)`);
+      try {
+        const stats = await runSynthesis(pool, {});
+        job.stats = stats;
+        job.status = "completed";
+        job.finishedAt = new Date().toISOString();
+        console.log(`[ADMIN] [SYNTHESIS JOB ${jobId}] completed`, stats);
+      } catch (err) {
+        job.status = "failed";
+        job.error = err?.message || String(err);
+        job.finishedAt = new Date().toISOString();
+        console.error(`[ADMIN] [SYNTHESIS JOB ${jobId}] failed:`, err?.message || err);
+      }
+    });
+
+    return res.status(202).json({
+      jobId,
+      status: "queued",
+      statusUrl: `/api/admin/synthesis-status/${jobId}`
+    });
   } catch (err) {
     console.error("[ADMIN] Synthesis error:", err.message);
     return res.status(500).json({ error: "Synthesis failed", message: err.message });
   }
+});
+
+router.get("/synthesis-status/:jobId", (req, res) => {
+  pruneSynthesisJobs();
+  const job = synthesisJobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: "Job not found or expired" });
+  }
+  return res.json(job);
 });
 
 // ── Per-course hole audit (for debugging specific courses like Herndon) ─────
@@ -477,6 +718,68 @@ router.get("/users", async (req, res) => {
   } catch (err) {
     console.error("[ADMIN] Users error:", err.message);
     return res.status(500).json({ error: "Users query failed" });
+  }
+});
+
+/**
+ * GET /api/admin/hazard-coverage
+ *
+ * Hazard POI coverage health across the entire course database.
+ * Reuses the same scoring logic as scripts/audit-hazard-coverage.js so
+ * CLI and admin dashboard can never disagree.
+ *
+ * Query params:
+ *   ?top=50           — number of weakest/strongest courses to return (default 50, cap 200)
+ */
+router.get("/hazard-coverage", async (req, res) => {
+  const pool = req.app.get("dbPool");
+  if (!pool) return res.status(503).json({ error: "Database unavailable" });
+
+  const top = Math.min(parseInt(req.query.top, 10) || 50, 200);
+
+  try {
+    const report = await buildCoverageReport(pool, { includePerHole: false });
+    return res.json({
+      totalCourses: report.summary.totalCourses,
+      totalHoles: report.summary.totalHoles,
+      totalUsableHazards: report.summary.totalUsableHazards,
+      avgCoveragePct: report.summary.avgCoveragePct,
+      avgCoverageScore: report.summary.avgCoverageScore,
+      coursesWithNoHazards: report.summary.coursesWithNoHazards,
+      coursesWithLowCoverage: report.summary.coursesWithLowCoverage,
+      normalizedTypeCounts: report.summary.normalizedTypeCounts,
+      weakestCourses: rankWeakest(report.courses, top),
+      strongestCourses: rankStrongest(report.courses, top)
+    });
+  } catch (err) {
+    console.error("[ADMIN] hazard-coverage error:", err.message);
+    return res.status(500).json({ error: "Hazard coverage query failed" });
+  }
+});
+
+/**
+ * GET /api/admin/hazard-coverage/:courseId
+ *
+ * Per-hole hazard breakdown for a specific course. Accepts either the
+ * internal UUID or the external course_id (matches resolveCourseId logic).
+ */
+router.get("/hazard-coverage/:courseId", async (req, res) => {
+  const pool = req.app.get("dbPool");
+  if (!pool) return res.status(503).json({ error: "Database unavailable" });
+
+  const lookup = String(req.params.courseId || "").trim();
+  if (!lookup) return res.status(400).json({ error: "courseId required" });
+
+  try {
+    const report = await buildCoverageReport(pool, { includePerHole: true });
+    const match = report.courses.find(
+      (c) => c.courseId === lookup || c.courseExternalId === lookup
+    );
+    if (!match) return res.status(404).json({ error: "Course not found" });
+    return res.json(match);
+  } catch (err) {
+    console.error("[ADMIN] hazard-coverage detail error:", err.message);
+    return res.status(500).json({ error: "Hazard coverage detail query failed" });
   }
 });
 

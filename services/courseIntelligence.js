@@ -5,6 +5,8 @@
  * Serves MUST PREFETCH payload from GET /api/courses/:id
  */
 
+const { isHazardPoi, normalizeHazardType } = require("./hazardClassifier");
+
 async function resolveCourseId(pool, idOrSlug) {
   const val = String(idOrSlug || "").trim();
   if (!val) return null;
@@ -238,17 +240,22 @@ async function getRoundCourseContext(pool, idOrSlug) {
   `;
 
   const teesSql = `
-    SELECT t.id, t.tee_name, t.slope, t.course_rating,
+    SELECT t.id, t.tee_name, t.tee_color, t.slope, t.course_rating,
            COALESCE(SUM(l.length), 0)::bigint AS total_yards
     FROM golf_tees t
     LEFT JOIN golf_tee_hole_lengths l ON l.tees_id = t.id
     WHERE t.course_id = $1
-    GROUP BY t.id, t.tee_name, t.slope, t.course_rating
+    GROUP BY t.id, t.tee_name, t.tee_color, t.slope, t.course_rating
     ORDER BY total_yards DESC
   `;
 
+  // Coarse pre-filter: tee/green are never hazards. Final classification
+  // happens in JS via normalizeHazardType() so non-hazards (yardage markers,
+  // doglegs, unknown POI types) are dropped before being injected into the
+  // decision engine or AI prompt.
   const hazardsSql = `
-    SELECT hole_number,
+    SELECT id::text AS id,
+           hole_number,
            TRIM(poi_type) AS poi_type,
            location_label,
            fairway_side,
@@ -279,6 +286,20 @@ async function getRoundCourseContext(pool, idOrSlug) {
     ORDER BY ht.hole_number, ht.tee_name
   `;
 
+  // Authoritative per-hole, per-tee yardage from golf_tee_hole_lengths.
+  // This is the canonical source — separate from golf_hole_tees.yardage which is sometimes
+  // synthesized for geometry. Keyed by tee_set_id + tee_name so iOS can resolve by selectedTee.id.
+  const holeLengthsSql = `
+    SELECT l.hole_number,
+           t.id  AS tee_set_id,
+           t.tee_name,
+           l.length AS yardage
+    FROM golf_tee_hole_lengths l
+    JOIN golf_tees t ON t.id = l.tees_id
+    WHERE t.course_id = $1
+    ORDER BY l.hole_number, t.tee_name
+  `;
+
   // Legacy tee POIs (fallback if golf_hole_tees not populated)
   const legacyTeeSql = `
     SELECT hole_number,
@@ -302,31 +323,52 @@ async function getRoundCourseContext(pool, idOrSlug) {
     pool.query(teesSql, [uuid]),
     pool.query(hazardsSql, [uuid]),
     pool.query(greenGeomSql, [uuid]),
-    pool.query(legacyTeeSql, [uuid])
+    pool.query(legacyTeeSql, [uuid]),
+    pool.query(holeLengthsSql, [uuid])
   ];
   if (hasHoleTeesTable) {
     queries.push(pool.query(holeTeesSql, [uuid]));
   }
 
   const results = await Promise.all(queries);
-  const [holesRes, teesRes, hazardsRes, greenGeomRes, legacyTeeRes] = results;
-  const holeTeesRes = hasHoleTeesTable ? results[5] : { rows: [] };
+  const [holesRes, teesRes, hazardsRes, greenGeomRes, legacyTeeRes, holeLengthsRes] = results;
+  const holeTeesRes = hasHoleTeesTable ? results[6] : { rows: [] };
 
-  // Index raw hazard POIs by hole (with lat/lon for client-side computation)
+  // Positive-whitelist classification: drop any POI whose normalized type
+  // is null (yardage markers, doglegs, mislabeled rows). Attach the canonical
+  // normalized_type so the iOS engine + admin dashboard can match without
+  // fragile substring logic.
   const rawHazardsByHole = {};
   const hazardDescsByHole = {};
+  let droppedNonHazardCount = 0;
   for (const r of hazardsRes.rows) {
+    const lat = Number(r.lat);
+    const lon = Number(r.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      droppedNonHazardCount++;
+      continue;
+    }
+    const normalizedType = normalizeHazardType(r.poi_type, r.location_label, r.fairway_side);
+    if (!normalizedType) {
+      droppedNonHazardCount++;
+      continue;
+    }
     if (!rawHazardsByHole[r.hole_number]) rawHazardsByHole[r.hole_number] = [];
     rawHazardsByHole[r.hole_number].push({
+      id: r.id || null,
       type: r.poi_type,
+      normalized_type: normalizedType,
       location_label: r.location_label || null,
       fairway_side: r.fairway_side || null,
-      lat: Number(r.lat),
-      lon: Number(r.lon)
+      lat,
+      lon
     });
     if (!hazardDescsByHole[r.hole_number]) hazardDescsByHole[r.hole_number] = [];
     const desc = buildHazardDescription(r.poi_type, r.location_label, r.fairway_side);
     if (desc) hazardDescsByHole[r.hole_number].push(desc);
+  }
+  if (droppedNonHazardCount > 0) {
+    console.log(`[COURSE_CONTEXT] dropped ${droppedNonHazardCount} non-hazard POIs (markers/doglegs/invalid coords)`);
   }
 
   // Index green geometry by hole
@@ -351,6 +393,18 @@ async function getRoundCourseContext(pool, idOrSlug) {
       coordinate: { lat: Number(r.lat), lon: Number(r.lon) },
       yardage: r.yardage,
       is_synthesized: r.is_synthesized
+    });
+  }
+
+  // Index canonical per-hole yardage by hole → [{tee_set_id, tee_name, yardage}].
+  // This is the table the iOS decision engine should use as the source of truth.
+  const holeLengthsByHole = {};
+  for (const r of holeLengthsRes.rows) {
+    if (!holeLengthsByHole[r.hole_number]) holeLengthsByHole[r.hole_number] = [];
+    holeLengthsByHole[r.hole_number].push({
+      tee_set_id: r.tee_set_id,
+      tee_name: r.tee_name,
+      yardage: Number(r.yardage)
     });
   }
 
@@ -400,6 +454,9 @@ async function getRoundCourseContext(pool, idOrSlug) {
         },
         // Per-tee coordinates (from golf_hole_tees)
         tees: holeTees,
+        // Canonical per-hole yardage by tee (from golf_tee_hole_lengths) — additive,
+        // backward-compatible. iOS uses this for accurate course-demand math.
+        hole_lengths: holeLengthsByHole[r.hole_number] || [],
         // Legacy fallback: generic tee POIs (for backward compat)
         tee_front: legacy.tee_front || null,
         tee_back: legacy.tee_back || null,
@@ -418,6 +475,7 @@ async function getRoundCourseContext(pool, idOrSlug) {
     tees: teesRes.rows.map((r) => ({
       id: r.id,
       name: r.tee_name,
+      color: r.tee_color || null,
       total_yards: Number(r.total_yards) || 0,
       slope: r.slope || null,
       course_rating: r.course_rating ? Number(r.course_rating) : null
