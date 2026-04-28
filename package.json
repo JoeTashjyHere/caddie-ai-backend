@@ -12,7 +12,10 @@
     "validate": "node scripts/validate-ingestion.js",
     "extract-data": "node scripts/extract-course-data.js",
     "synthesize": "node scripts/synthesize-hole-tees.js",
-    "synthesize:dry": "node scripts/synthesize-hole-tees.js --dry-run"
+    "synthesize:dry": "node scripts/synthesize-hole-tees.js --dry-run",
+    "osm:audit": "node scripts/audit-hazard-coverage.js --top=20",
+    "osm:batch:dry": "node scripts/osm-enrich-batch.js",
+    "osm:batch:apply": "node scripts/osm-enrich-batch.js --apply"
   },
   "engines": {
     "node": ">=18.0.0"

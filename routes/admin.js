@@ -785,6 +785,85 @@ router.get("/hazard-coverage/:courseId", async (req, res) => {
 });
 
 /**
+ * GET /api/admin/osm-batch-status
+ *
+ * Read-only observability for the batch OSM enrichment script.
+ * Returns:
+ *   - latestRun: most recent run summary (counts, status, timestamps)
+ *   - recentRuns: last N runs (default 10)
+ *   - queueDepth: an approximate count of courses still eligible for enrichment
+ *                 (coverageScore < 50, never successfully enriched, has greens)
+ *   - sourceBreakdown: native vs OSM POI totals
+ *
+ * This endpoint never triggers work. The batch is a CLI script invoked
+ * out-of-band; this endpoint is purely for founder/operator visibility.
+ */
+router.get("/osm-batch-status", async (req, res) => {
+  const pool = req.app.get("dbPool");
+  if (!pool) return res.status(503).json({ error: "Database unavailable" });
+  const limit = Math.min(parseInt(req.query.limit, 10) || 10, 50);
+
+  try {
+    const [latestRes, recentRes, sourceRes, queueDepthRes] = await Promise.all([
+      pool.query(`
+        SELECT run_id, started_at, completed_at, mode, status,
+               queue_size, processed, succeeded, failed, skipped, total_inserted, notes
+          FROM osm_enrichment_runs
+         ORDER BY started_at DESC
+         LIMIT 1
+      `).catch(() => ({ rows: [] })),
+      pool.query(`
+        SELECT run_id, started_at, completed_at, mode, status,
+               queue_size, processed, succeeded, failed, skipped, total_inserted
+          FROM osm_enrichment_runs
+         ORDER BY started_at DESC
+         LIMIT $1
+      `, [limit]).catch(() => ({ rows: [] })),
+      pool.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE source_type = 'source_native')          AS native_count,
+          COUNT(*) FILTER (WHERE source_type = 'source_osm')             AS osm_count,
+          COUNT(*) FILTER (WHERE source_type = 'source_user_reported')   AS user_count,
+          COUNT(*) FILTER (WHERE source_type = 'source_admin_verified')  AS admin_count
+        FROM golf_hole_pois
+      `).catch(() => ({ rows: [{}] })),
+      // Approx queue depth: courses with green geometry that have never had a
+      // 'success' attempt. This is intentionally cheap — operator-grade
+      // visibility, not pixel-perfect.
+      pool.query(`
+        WITH greens AS (
+          SELECT DISTINCT course_id
+            FROM golf_hole_pois
+           WHERE LOWER(TRIM(poi_type)) = 'green'
+        ),
+        successes AS (
+          SELECT DISTINCT course_id FROM osm_enrichment_attempts WHERE status = 'success'
+        )
+        SELECT COUNT(*)::int AS pending
+          FROM greens g
+          LEFT JOIN successes s USING (course_id)
+         WHERE s.course_id IS NULL
+      `).catch(() => ({ rows: [{ pending: null }] }))
+    ]);
+
+    return res.json({
+      latestRun: latestRes.rows[0] || null,
+      recentRuns: recentRes.rows,
+      sourceBreakdown: {
+        native: Number(sourceRes.rows[0]?.native_count || 0),
+        osm: Number(sourceRes.rows[0]?.osm_count || 0),
+        user_reported: Number(sourceRes.rows[0]?.user_count || 0),
+        admin_verified: Number(sourceRes.rows[0]?.admin_count || 0)
+      },
+      queueDepth: queueDepthRes.rows[0]?.pending ?? null
+    });
+  } catch (err) {
+    console.error("[ADMIN] osm-batch-status:", err.message);
+    return res.status(500).json({ error: "Status query failed", detail: err.message });
+  }
+});
+
+/**
  * POST /api/admin/enrich-osm/:courseId
  *
  * Additive OSM hazard enrichment for a single course.
