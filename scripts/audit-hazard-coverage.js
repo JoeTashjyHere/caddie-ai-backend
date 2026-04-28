@@ -62,6 +62,13 @@ function parseArgs(argv) {
 async function buildCoverageReport(pool, opts = {}) {
   const includePerHole = opts.includePerHole !== false;
 
+  // source_type may not exist yet on older deploys (migration 006 not yet
+  // applied) — fall back to NULL → counted as native.
+  const hasSourceType = await columnExists(pool, "golf_hole_pois", "source_type");
+  const sourceCol = hasSourceType
+    ? `COALESCE(p.source_type, 'source_native') AS source_type`
+    : `'source_native'::text AS source_type`;
+
   const sql = `
     SELECT c.id           AS course_uuid,
            c.course_id    AS course_id,
@@ -74,7 +81,8 @@ async function buildCoverageReport(pool, opts = {}) {
            p.location_label,
            p.fairway_side,
            p.lat,
-           p.lon
+           p.lon,
+           ${sourceCol}
     FROM golf_courses c
     JOIN golf_course_holes h ON h.course_id = c.id
     LEFT JOIN golf_hole_pois p
@@ -85,9 +93,15 @@ async function buildCoverageReport(pool, opts = {}) {
   `;
   const res = await pool.query(sql);
 
-  // courseUuid → { meta, perHoleMap }
+  // courseUuid → { meta, perHoleMap, sourceBreakdown }
   const courseMap = new Map();
   const normalizedTypeCounts = {};
+  const globalSourceBreakdown = {
+    source_native: 0,
+    source_osm: 0,
+    source_user_reported: 0,
+    source_admin_verified: 0
+  };
   let totalUsableHazards = 0;
   let totalPoisSeen = 0;
   let totalPoisWithCoords = 0;
@@ -100,7 +114,13 @@ async function buildCoverageReport(pool, opts = {}) {
         courseId: row.course_id,
         courseName: row.course_name || "(unknown)",
         numHoles: Number(row.num_holes) || 18,
-        perHole: new Map()
+        perHole: new Map(),
+        sourceBreakdown: {
+          source_native: 0,
+          source_osm: 0,
+          source_user_reported: 0,
+          source_admin_verified: 0
+        }
       });
     }
     const course = courseMap.get(courseKey);
@@ -138,6 +158,18 @@ async function buildCoverageReport(pool, opts = {}) {
 
     normalizedTypeCounts[normalizedType] = (normalizedTypeCounts[normalizedType] || 0) + 1;
     totalUsableHazards += 1;
+
+    const src = String(row.source_type || "source_native");
+    if (Object.prototype.hasOwnProperty.call(course.sourceBreakdown, src)) {
+      course.sourceBreakdown[src] += 1;
+    } else {
+      course.sourceBreakdown[src] = 1;
+    }
+    if (Object.prototype.hasOwnProperty.call(globalSourceBreakdown, src)) {
+      globalSourceBreakdown[src] += 1;
+    } else {
+      globalSourceBreakdown[src] = 1;
+    }
   }
 
   // Roll up per-course aggregates
@@ -192,7 +224,8 @@ async function buildCoverageReport(pool, opts = {}) {
       avgHazardsPerHole: totalHolesC > 0 ? Math.round((totalHazards / totalHolesC) * 10) / 10 : 0,
       hazardCoveragePct: totalHolesC > 0 ? Math.round((holesWithHazards / totalHolesC) * 100) : 0,
       hazardCoverageScore: score,
-      coverageStatus: status
+      coverageStatus: status,
+      sourceBreakdown: c.sourceBreakdown
     };
     if (includePerHole) {
       courseRecord.holes = perHole.map((h) => ({
@@ -230,10 +263,27 @@ async function buildCoverageReport(pool, opts = {}) {
       avgCoverageScore,
       coursesWithNoHazards,
       coursesWithLowCoverage,
-      normalizedTypeCounts
+      normalizedTypeCounts,
+      sourceBreakdown: globalSourceBreakdown
     },
     courses
   };
+}
+
+/**
+ * Check whether a column exists on a table. Used to keep audit
+ * compatible with deploys that have not yet applied migration 006.
+ */
+async function columnExists(pool, table, column) {
+  try {
+    const r = await pool.query(
+      `SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2 LIMIT 1`,
+      [table, column]
+    );
+    return r.rowCount > 0;
+  } catch {
+    return false;
+  }
 }
 
 function rankWeakest(courses, limit) {

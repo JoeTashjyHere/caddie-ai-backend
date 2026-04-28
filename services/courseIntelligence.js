@@ -253,13 +253,21 @@ async function getRoundCourseContext(pool, idOrSlug) {
   // happens in JS via normalizeHazardType() so non-hazards (yardage markers,
   // doglegs, unknown POI types) are dropped before being injected into the
   // decision engine or AI prompt.
+  //
+  // source_type/confidence columns may not exist on older deploys (mig 006);
+  // we still want to return safe defaults so iOS decoders never break.
+  const hasProvenance = await columnExists(pool, "golf_hole_pois", "source_type");
+  const provenanceCols = hasProvenance
+    ? `COALESCE(source_type, 'source_native') AS source_type, confidence`
+    : `'source_native'::text AS source_type, NULL::real AS confidence`;
   const hazardsSql = `
     SELECT id::text AS id,
            hole_number,
            TRIM(poi_type) AS poi_type,
            location_label,
            fairway_side,
-           lat, lon
+           lat, lon,
+           ${provenanceCols}
     FROM golf_hole_pois
     WHERE course_id = $1
       AND LOWER(TRIM(poi_type)) NOT IN ('green', 'tee', 'tee front', 'tee back')
@@ -361,7 +369,9 @@ async function getRoundCourseContext(pool, idOrSlug) {
       location_label: r.location_label || null,
       fairway_side: r.fairway_side || null,
       lat,
-      lon
+      lon,
+      source_type: r.source_type || "source_native",
+      confidence: r.confidence != null ? Number(r.confidence) : null
     });
     if (!hazardDescsByHole[r.hole_number]) hazardDescsByHole[r.hole_number] = [];
     const desc = buildHazardDescription(r.poi_type, r.location_label, r.fairway_side);
@@ -539,6 +549,22 @@ function assessGeometryQuality(greenCenter, holeTees, legacyTee) {
     map_alignment_ready: mapAlignmentReady,
     computed_bearing: computedBearing
   };
+}
+
+/**
+ * Check whether a column exists. Used so /api/course-context degrades
+ * gracefully on deploys that have not yet applied newer migrations.
+ */
+async function columnExists(pool, table, column) {
+  try {
+    const r = await pool.query(
+      `SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2 LIMIT 1`,
+      [table, column]
+    );
+    return r.rowCount > 0;
+  } catch {
+    return false;
+  }
 }
 
 function buildHazardDescription(poiType, locationLabel, fairwaySide) {

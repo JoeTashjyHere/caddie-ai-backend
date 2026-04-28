@@ -4,6 +4,7 @@ const express = require("express");
 const router = express.Router();
 
 const { buildCoverageReport, rankWeakest, rankStrongest } = require("../scripts/audit-hazard-coverage");
+const { enrichCourse } = require("../services/osmEnricher");
 
 router.get("/dashboard", async (req, res) => {
   const pool = req.app.get("dbPool");
@@ -780,6 +781,48 @@ router.get("/hazard-coverage/:courseId", async (req, res) => {
   } catch (err) {
     console.error("[ADMIN] hazard-coverage detail error:", err.message);
     return res.status(500).json({ error: "Hazard coverage detail query failed" });
+  }
+});
+
+/**
+ * POST /api/admin/enrich-osm/:courseId
+ *
+ * Additive OSM hazard enrichment for a single course.
+ *
+ * SAFETY:
+ *   - Default mode is dry-run: returns proposed inserts WITHOUT writing.
+ *   - To actually write, pass `?apply=1`.
+ *   - Never overwrites source_native data; deduplicates against existing
+ *     native + OSM rows. All inserts are tagged source_type='source_osm'
+ *     with confidence < 1.0 so downstream code can weight trust.
+ *
+ * Response:
+ *   - courseUuid, courseName, dryRun
+ *   - osmFeaturesFetched, osmFeaturesMapped
+ *   - skippedNoCenter / skippedOutsideHoles / skippedDuplicateOf{Native,Osm}
+ *   - inserted (only when apply=1)
+ *   - insertedByType, insertedByHole
+ *   - proposedRows[]  (what would be / was inserted)
+ */
+router.post("/enrich-osm/:courseId", async (req, res) => {
+  const pool = req.app.get("dbPool");
+  if (!pool) return res.status(503).json({ error: "Database unavailable" });
+
+  const courseUuid = String(req.params.courseId || "").trim();
+  if (!courseUuid) return res.status(400).json({ error: "courseId required" });
+
+  const apply = req.query.apply === "1" || req.query.apply === "true";
+  const maxFeatures = Math.min(parseInt(req.query.max, 10) || 2000, 5000);
+
+  try {
+    const trace = await enrichCourse(pool, courseUuid, {
+      dryRun: !apply,
+      maxFeatures
+    });
+    return res.json(trace);
+  } catch (err) {
+    console.error("[ADMIN] enrich-osm error:", err.message);
+    return res.status(500).json({ error: "OSM enrichment failed", detail: err.message });
   }
 });
 
