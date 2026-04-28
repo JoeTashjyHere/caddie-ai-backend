@@ -389,7 +389,7 @@ app.get("/api/health", async (req, res) => {
   out.deployedAt = DEPLOY_TIMESTAMP;
   res.json(out);
 });
-const DEPLOY_VERSION = "2026-04-28-osm-enrichment";
+const DEPLOY_VERSION = "2026-04-28-osm-enrichment.2";
 const DEPLOY_TIMESTAMP = new Date().toISOString();
 app.get("/version", (req, res) => res.json({ version: DEPLOY_VERSION, deployedAt: DEPLOY_TIMESTAMP }));
 

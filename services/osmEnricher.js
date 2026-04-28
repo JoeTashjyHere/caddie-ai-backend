@@ -160,11 +160,15 @@ async function enrichCourse(pool, courseUuid, opts = {}) {
 // ── Geometry & DB helpers ──────────────────────────────────────────────
 
 async function loadHoleGeometry(pool, courseUuid) {
-  // Per-hole tee+green from the canonical sources used elsewhere.
+  // Per-hole tee+green. Tee resolution prefers golf_hole_tees (synthesized
+  // tees with full per-tee-set coordinates); falls back to legacy Tee
+  // Front / Tee Back POIs for courses where synthesis hasn't run yet.
+  // This mirrors the same fallback chain used by getRoundCourseContext.
   const sql = `
     SELECT h.hole_number,
-           ht.lat AS tee_lat, ht.lon AS tee_lon,
-           gg.lat AS green_lat, gg.lon AS green_lon,
+           ht.lat       AS tee_lat,       ht.lon       AS tee_lon,
+           tf.lat       AS legacy_tee_lat, tf.lon      AS legacy_tee_lon,
+           gg.lat       AS green_lat,     gg.lon       AS green_lon,
            COALESCE(l.length, 0)::int AS yardage
     FROM golf_course_holes h
     LEFT JOIN LATERAL (
@@ -173,6 +177,18 @@ async function loadHoleGeometry(pool, courseUuid) {
       WHERE course_id = h.course_id AND hole_number = h.hole_number
       ORDER BY tee_name LIMIT 1
     ) ht ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT lat, lon
+      FROM golf_hole_pois
+      WHERE course_id = h.course_id AND hole_number = h.hole_number
+        AND LOWER(TRIM(poi_type)) IN ('tee front', 'tee', 'tee back')
+      ORDER BY CASE LOWER(TRIM(poi_type))
+        WHEN 'tee front' THEN 1
+        WHEN 'tee'       THEN 2
+        WHEN 'tee back'  THEN 3
+        ELSE 9 END
+      LIMIT 1
+    ) tf ON TRUE
     LEFT JOIN LATERAL (
       SELECT AVG(lat)::float8 AS lat, AVG(lon)::float8 AS lon
       FROM golf_hole_pois
@@ -191,8 +207,10 @@ async function loadHoleGeometry(pool, courseUuid) {
   const res = await pool.query(sql, [courseUuid]);
   const holes = [];
   for (const r of res.rows) {
-    if (r.tee_lat == null || r.green_lat == null) continue;
-    const tee   = { lat: Number(r.tee_lat),   lon: Number(r.tee_lon) };
+    const teeLat = r.tee_lat != null ? Number(r.tee_lat) : (r.legacy_tee_lat != null ? Number(r.legacy_tee_lat) : null);
+    const teeLon = r.tee_lon != null ? Number(r.tee_lon) : (r.legacy_tee_lon != null ? Number(r.legacy_tee_lon) : null);
+    if (teeLat == null || teeLon == null || r.green_lat == null) continue;
+    const tee   = { lat: teeLat,             lon: teeLon };
     const green = { lat: Number(r.green_lat), lon: Number(r.green_lon) };
     const yd = Number(r.yardage) || Math.round(yardsBetween(tee.lat, tee.lon, green.lat, green.lon));
     holes.push({ holeNumber: Number(r.hole_number), tee, green, yardage: yd });
