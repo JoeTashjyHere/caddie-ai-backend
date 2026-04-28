@@ -785,6 +785,185 @@ router.get("/hazard-coverage/:courseId", async (req, res) => {
 });
 
 /**
+ * POST /api/admin/osm-batch
+ *
+ * Bounded validation trigger for the batch enricher. NOT the production
+ * tool — scripts/osm-enrich-batch.js is the production tool.
+ *
+ * This endpoint exists so operators can sanity-check the pipeline
+ * end-to-end without DATABASE_URL access. It is intentionally capped:
+ *   - limit ≤ 10 courses
+ *   - hard timeout 90 s
+ *   - apply mode requires explicit ?apply=1
+ *
+ * Full-scale enrichment (hundreds or thousands of courses) MUST be run
+ * via the CLI script:
+ *   node scripts/osm-enrich-batch.js --limit=200 --apply
+ */
+router.post("/osm-batch", async (req, res) => {
+  const pool = req.app.get("dbPool");
+  if (!pool) return res.status(503).json({ error: "Database unavailable" });
+
+  const limit = Math.min(parseInt(req.query.limit, 10) || 5, 10);
+  const apply = req.query.apply === "1" || req.query.apply === "true";
+  const delayMs = Math.min(parseInt(req.query["delay-ms"], 10) || 1500, 5000);
+
+  // The batch run() takes its own pool. We pass DATABASE_URL through
+  // env to keep the API surface unchanged.
+  if (!process.env.DATABASE_URL) {
+    return res.status(503).json({ error: "DATABASE_URL not configured for batch trigger" });
+  }
+
+  const args = {
+    apply,
+    limit,
+    minScore: -1,
+    maxScore: 50,
+    delayMs,
+    maxQueriesPerRun: limit + 5,    // generous but bounded
+    retryFailed: false,
+    cooldownDays: 14,
+    courseId: null,
+    verbose: false,
+    bounded: true                   // marker for diagnostics
+  };
+
+  // Capture the run via a separate Pool so the request handler doesn't
+  // hold one of the dyno's main connections for the whole batch.
+  const { Pool } = require("pg");
+  const isolatedPool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false },
+    max: 3
+  });
+
+  // The run() function in the batch script ends its own pool when done.
+  // Here we override its DB by stubbing process.env temporarily — but
+  // simpler: import the orchestrator helpers directly and call them
+  // with our isolatedPool. We rebuild the loop inline to avoid coupling.
+  try {
+    const { buildQueue } = require("../scripts/osm-enrich-batch");
+    const { enrichCourse } = require("../services/osmEnricher");
+
+    const log = (m) => console.log(`[OSM BATCH BOUNDED] ${m}`);
+    log(`mode=${apply ? "APPLY" : "DRY"} limit=${limit}`);
+
+    const startRes = await isolatedPool.query(
+      `INSERT INTO osm_enrichment_runs (mode, args_json, status)
+       VALUES ($1, $2::jsonb, 'running')
+       RETURNING run_id`,
+      [apply ? "apply" : "dry", JSON.stringify(args)]
+    );
+    const runId = startRes.rows[0].run_id;
+
+    const queue = await buildQueue(isolatedPool, args, log);
+
+    await isolatedPool.query(
+      `UPDATE osm_enrichment_runs SET queue_size = $2 WHERE run_id = $1`,
+      [runId, queue.length]
+    );
+
+    const counters = { queueSize: queue.length, processed: 0, succeeded: 0, failed: 0, skipped: 0, totalInserted: 0 };
+    const winners = [];
+
+    const deadline = Date.now() + 90_000;
+    for (let i = 0; i < queue.length; i++) {
+      if (Date.now() >= deadline) {
+        log("90 s timeout — stopping early");
+        break;
+      }
+      const c = queue[i];
+      const t0 = Date.now();
+      let result;
+      try {
+        const trace = await enrichCourse(isolatedPool, c.courseId, { dryRun: !apply, maxFeatures: 2000 });
+        if (trace.error) result = { status: "no_geometry", trace };
+        else if (trace.osmFeaturesFetched === 0) result = { status: "no_features", trace };
+        else result = { status: "success", trace };
+      } catch (err) {
+        result = { status: "overpass_error", error: String(err.message || err) };
+      }
+
+      counters.processed++;
+      const trace = result.trace || {};
+      const inserted = apply ? (trace.inserted || 0) : 0;
+      const proposed = (trace.proposedRows || []).length;
+
+      if (result.status === "success") {
+        counters.succeeded++;
+        counters.totalInserted += inserted;
+        const before = c.hazardCoverageScore;
+        // Cheap after-score: count distinct holes with hazards quickly
+        let after = before;
+        if (apply && inserted > 0) {
+          const r = await isolatedPool.query(
+            `SELECT COUNT(*) FILTER (WHERE n > 0)::int AS holes_with_hazards
+               FROM (SELECT hole_number, COUNT(*) AS n
+                       FROM golf_hole_pois
+                      WHERE course_id = $1
+                        AND LOWER(TRIM(poi_type)) NOT IN ('green','tee','tee front','tee back')
+                      GROUP BY hole_number) h`,
+            [c.courseId]
+          );
+          // Quick & dirty post-score from holes-with-hazards portion (40 pts) + bunkers proxy
+          const holesWithHazards = r.rows[0].holes_with_hazards;
+          after = Math.min(100, Math.round((holesWithHazards / Math.max(1, c.totalHoles)) * 40 + 50));
+        }
+        winners.push({ name: c.courseName, before, after, delta: after - before, inserted });
+        await isolatedPool.query(
+          `INSERT INTO osm_enrichment_attempts
+             (run_id, course_id, course_name, status, before_score, after_score, proposed, inserted, trace_summary)
+           VALUES ($1, $2, $3, 'success', $4, $5, $6, $7, $8::jsonb)`,
+          [runId, c.courseId, c.courseName, before, after, proposed, inserted, JSON.stringify({
+            osmFeaturesFetched: trace.osmFeaturesFetched,
+            insertedByType: trace.insertedByType,
+            insertedByHole: trace.insertedByHole
+          })]
+        );
+        log(`  [${i+1}/${queue.length}] ${c.courseName} ${apply?"INSERTED":"PROPOSED"}=${apply?inserted:proposed} elapsed=${Date.now()-t0}ms`);
+      } else {
+        counters.skipped++;
+        await isolatedPool.query(
+          `INSERT INTO osm_enrichment_attempts
+             (run_id, course_id, course_name, status, before_score, after_score, reason)
+           VALUES ($1, $2, $3, $4, $5, $5, $6)`,
+          [runId, c.courseId, c.courseName, result.status, c.hazardCoverageScore, result.error || result.status]
+        );
+        log(`  [${i+1}/${queue.length}] ${c.courseName} skipped=${result.status}`);
+      }
+
+      await isolatedPool.query(
+        `UPDATE osm_enrichment_runs
+            SET processed=$2, succeeded=$3, failed=$4, skipped=$5, total_inserted=$6
+          WHERE run_id=$1`,
+        [runId, counters.processed, counters.succeeded, counters.failed, counters.skipped, counters.totalInserted]
+      );
+
+      if (i < queue.length - 1) await new Promise((r) => setTimeout(r, delayMs));
+    }
+
+    await isolatedPool.query(
+      `UPDATE osm_enrichment_runs SET completed_at = now(), status = 'complete' WHERE run_id = $1`,
+      [runId]
+    );
+
+    return res.json({
+      runId,
+      mode: apply ? "apply" : "dry",
+      bounded: true,
+      counters,
+      winners: winners.sort((a, b) => b.delta - a.delta).slice(0, 10),
+      note: "Bounded validation trigger. For full-scale enrichment, use scripts/osm-enrich-batch.js with DATABASE_URL."
+    });
+  } catch (err) {
+    console.error("[ADMIN] osm-batch error:", err.message, err.stack);
+    return res.status(500).json({ error: "Bounded batch failed", detail: err.message });
+  } finally {
+    isolatedPool.end().catch(() => {});
+  }
+});
+
+/**
  * GET /api/admin/osm-batch-status
  *
  * Read-only observability for the batch OSM enrichment script.
