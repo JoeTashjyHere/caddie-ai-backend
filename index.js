@@ -389,7 +389,7 @@ app.get("/api/health", async (req, res) => {
   out.deployedAt = DEPLOY_TIMESTAMP;
   res.json(out);
 });
-const DEPLOY_VERSION = "2026-04-28-osm-batch.2";
+const DEPLOY_VERSION = "2026-05-05-auth.1";
 const DEPLOY_TIMESTAMP = new Date().toISOString();
 app.get("/version", (req, res) => res.json({ version: DEPLOY_VERSION, deployedAt: DEPLOY_TIMESTAMP }));
 
@@ -803,6 +803,68 @@ app.use("/api/admin", adminRouter);
 const shotOutcomesRouter = require("./routes/shotOutcomes");
 app.use("/api/shot-outcomes", shotOutcomesRouter);
 
+const authRouter = require("./routes/auth");
+app.use("/auth", authRouter);
+app.use("/api/auth", authRouter);
+
+async function ensureAuthSchema() {
+  if (!dbPool) return false;
+  try {
+    await dbPool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+  } catch (err) {
+    // pgcrypto may already be present, or the role lacks superuser. The
+    // schema creation will still succeed if a default UUID generator is
+    // available; we surface this only as a warning.
+    console.warn("[INIT] pgcrypto extension skipped:", err.message);
+  }
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      display_name      TEXT,
+      email             TEXT UNIQUE,
+      phone             TEXT,
+      anonymous_user_id TEXT UNIQUE,
+      is_deleted        BOOLEAN NOT NULL DEFAULT FALSE,
+      deleted_at        TIMESTAMPTZ,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await dbPool.query(`
+    CREATE INDEX IF NOT EXISTS idx_users_email_lower
+      ON users (LOWER(email))
+      WHERE email IS NOT NULL;
+  `);
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS user_identities (
+      id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      provider         TEXT NOT NULL CHECK (provider IN ('apple','google','email')),
+      provider_user_id TEXT NOT NULL,
+      email            TEXT,
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (provider, provider_user_id)
+    );
+  `);
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS email_credentials (
+      user_id        UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      password_hash  TEXT NOT NULL,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS auth_revoked_tokens (
+      jti        TEXT PRIMARY KEY,
+      user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      revoked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ NOT NULL
+    );
+  `);
+  return true;
+}
+
 // Text-only OpenAI endpoint
 app.post("/api/openai/complete", async (req, res) => {
   try {
@@ -989,6 +1051,18 @@ function runInitTasksInBackground() {
       console.log("[INIT] recommendation tables ready");
     } catch (err) {
       console.warn("[INIT] recommendation tables skipped:", err.message);
+    }
+
+    try {
+      await ensureAuthSchema();
+      console.log("[INIT] auth tables ready");
+      if (!process.env.JWT_SECRET) {
+        console.warn(
+          "[INIT] JWT_SECRET is not set. /auth/* endpoints will return 500 until configured."
+        );
+      }
+    } catch (err) {
+      console.warn("[INIT] auth schema skipped:", err.message);
     }
 
     console.log("[INIT] foreground scheduling complete");
