@@ -389,7 +389,7 @@ app.get("/api/health", async (req, res) => {
   out.deployedAt = DEPLOY_TIMESTAMP;
   res.json(out);
 });
-const DEPLOY_VERSION = "2026-05-05-auth.1";
+const DEPLOY_VERSION = "2026-05-12-profile-sync.1";
 const DEPLOY_TIMESTAMP = new Date().toISOString();
 app.get("/version", (req, res) => res.json({ version: DEPLOY_VERSION, deployedAt: DEPLOY_TIMESTAMP }));
 
@@ -807,6 +807,12 @@ const authRouter = require("./routes/auth");
 app.use("/auth", authRouter);
 app.use("/api/auth", authRouter);
 
+// V8.1 — Profile sync. Mounted at /user and /api/user so iOS can
+// reach /user/profile and /api/user/profile (mirrors auth router).
+const userProfileRouter = require("./routes/userProfile");
+app.use("/user", userProfileRouter);
+app.use("/api/user", userProfileRouter);
+
 async function ensureAuthSchema() {
   if (!dbPool) return false;
   try {
@@ -863,6 +869,36 @@ async function ensureAuthSchema() {
     );
   `);
   return true;
+}
+
+/**
+ * V8.1 — Ensure user_profiles exists for profile sync. Idempotent;
+ * the canonical migration is 009_user_profiles.sql but we mirror
+ * the DDL here so a brand-new Render instance that boots before
+ * the migration runner finishes still has a usable schema. The
+ * route layer is also defensive (falls back to {profile: null}
+ * if the table is genuinely missing).
+ */
+async function ensureUserProfileSchema() {
+  if (!dbPool) return false;
+  try {
+    await dbPool.query(`
+      CREATE TABLE IF NOT EXISTS user_profiles (
+        user_id      UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        profile_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+    await dbPool.query(`
+      CREATE INDEX IF NOT EXISTS idx_user_profiles_json
+        ON user_profiles USING GIN (profile_json jsonb_path_ops);
+    `);
+    return true;
+  } catch (err) {
+    console.warn("[INIT] user_profiles schema skipped:", err.message);
+    return false;
+  }
 }
 
 // Text-only OpenAI endpoint
@@ -1063,6 +1099,13 @@ function runInitTasksInBackground() {
       }
     } catch (err) {
       console.warn("[INIT] auth schema skipped:", err.message);
+    }
+
+    try {
+      const ok = await ensureUserProfileSchema();
+      if (ok) console.log("[INIT] user_profiles table ready");
+    } catch (err) {
+      console.warn("[INIT] user_profiles schema skipped:", err.message);
     }
 
     console.log("[INIT] foreground scheduling complete");
